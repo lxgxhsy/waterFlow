@@ -2,6 +2,9 @@ package com.yizhaoqi.smartpai.service;
 
 import com.yizhaoqi.smartpai.model.FileUpload;
 import com.yizhaoqi.smartpai.model.User;
+import com.yizhaoqi.smartpai.model.ChunkInfo;
+import com.yizhaoqi.smartpai.exception.CustomException;
+import com.yizhaoqi.smartpai.repository.ChunkInfoRepository;
 import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.repository.UserRepository;
@@ -12,6 +15,8 @@ import io.minio.RemoveObjectArgs;
 import io.minio.http.Method;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.http.HttpStatus;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -39,7 +44,13 @@ public class DocumentService {
     private DocumentVectorRepository documentVectorRepository;
 
     @Autowired
+    private ChunkInfoRepository chunkInfoRepository;
+
+    @Autowired
     private MinioClient minioClient;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
 
     @Autowired
     private ElasticsearchService elasticsearchService;
@@ -61,56 +72,68 @@ public class DocumentService {
      * @param fileMd5 文件MD5
      */
     @Transactional
-    public void deleteDocument(String fileMd5, String userId) {
+    public void deleteDocument(String fileMd5, String userId, String role) {
         logger.info("开始删除文档: {}", fileMd5);
         
         try {
-            // 获取文件信息以获取文件名
-            FileUpload fileUpload = fileUploadRepository.findByFileMd5AndUserId(fileMd5, userId)
-                    .orElseThrow(() -> new RuntimeException("文件不存在"));
-            
-            // 1. 删除Elasticsearch中的数据
-            try {
-                elasticsearchService.deleteByFileMd5(fileMd5);
-                logger.info("成功从Elasticsearch删除文档: {}", fileMd5);
-            } catch (Exception e) {
-                logger.error("从Elasticsearch删除文档时出错: {}", fileMd5, e);
-                // 继续删除其他数据
+            FileUpload fileUpload = fileUploadRepository.findByFileMd5(fileMd5)
+                    .orElseThrow(() -> new CustomException("文档不存在", HttpStatus.NOT_FOUND));
+
+            if (!fileUpload.getUserId().equals(userId) && !"ADMIN".equals(role)) {
+                throw new CustomException("没有权限删除此文档", HttpStatus.FORBIDDEN);
             }
+
+            List<ChunkInfo> chunkInfos = chunkInfoRepository.findByFileMd5OrderByChunkIndexAsc(fileMd5);
             
-            // 2. 删除MinIO中的文件
-            try {
-                String objectName = "merged/" + fileUpload.getFileName();
+            elasticsearchService.deleteByFileMd5(fileMd5);
+            logger.info("成功从Elasticsearch删除文档: {}", fileMd5);
+            
+            String objectName = "merged/" + fileUpload.getFileName();
+            minioClient.removeObject(
+                    RemoveObjectArgs.builder()
+                            .bucket("uploads")
+                            .object(objectName)
+                            .build()
+            );
+            logger.info("成功从MinIO删除合并文件: {}", objectName);
+
+            for (ChunkInfo chunkInfo : chunkInfos) {
+                if (chunkInfo.getStoragePath() == null || chunkInfo.getStoragePath().isBlank()) {
+                    continue;
+                }
                 minioClient.removeObject(
                         RemoveObjectArgs.builder()
                                 .bucket("uploads")
-                                .object(objectName)
+                                .object(chunkInfo.getStoragePath())
                                 .build()
                 );
-                logger.info("成功从MinIO删除文件: {}", objectName);
-            } catch (Exception e) {
-                logger.error("从MinIO删除文件时出错: {}", fileMd5, e);
-                // 继续删除其他数据
+                logger.info("成功从MinIO删除分片文件: {}", chunkInfo.getStoragePath());
             }
+
+            String redisKey = "upload:" + fileUpload.getUserId() + ":" + fileMd5;
+            redisTemplate.delete(redisKey);
+            logger.info("成功删除Redis上传状态: {}", redisKey);
             
-            // 3. 删除DocumentVector记录
-            try {
-                documentVectorRepository.deleteByFileMd5(fileMd5);
-                logger.info("成功删除文档向量记录: {}", fileMd5);
-            } catch (Exception e) {
-                logger.error("删除文档向量记录时出错: {}", fileMd5, e);
-                // 继续删除其他数据
-            }
+            documentVectorRepository.deleteByFileMd5(fileMd5);
+            logger.info("成功删除文档向量记录: {}", fileMd5);
+
+            chunkInfoRepository.deleteByFileMd5(fileMd5);
+            logger.info("成功删除分片元数据记录: {}", fileMd5);
             
-            // 4. 删除FileUpload记录
             fileUploadRepository.deleteByFileMd5(fileMd5);
             logger.info("成功删除文件上传记录: {}", fileMd5);
             
             logger.info("文档删除完成: {}", fileMd5);
+        } catch (CustomException e) {
+            throw e;
         } catch (Exception e) {
             logger.error("删除文档过程中发生错误: {}", fileMd5, e);
             throw new RuntimeException("删除文档失败: " + e.getMessage(), e);
         }
+    }
+
+    public void deleteDocument(String fileMd5, String userId) {
+        deleteDocument(fileMd5, userId, "USER");
     }
     
     /**

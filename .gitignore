@@ -76,3 +76,8 @@ frontend/src/typings/auto-imports.d.ts
 frontend/public/languages
 frontend/public/themes
 src/main/resources/application.yml~
+
+# Local environment variables
+.env
+.env.*
+!.env.example

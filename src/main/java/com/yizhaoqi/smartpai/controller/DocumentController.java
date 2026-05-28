@@ -2,6 +2,7 @@ package com.yizhaoqi.smartpai.controller;
 
 import com.yizhaoqi.smartpai.model.FileUpload;
 import com.yizhaoqi.smartpai.model.OrganizationTag;
+import com.yizhaoqi.smartpai.exception.CustomException;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.repository.OrganizationTagRepository;
 import com.yizhaoqi.smartpai.service.DocumentService;
@@ -63,40 +64,22 @@ public class DocumentController {
         LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("DELETE_DOCUMENT");
         try {
             LogUtils.logBusiness("DELETE_DOCUMENT", userId, "接收到删除文档请求: fileMd5=%s, role=%s", fileMd5, role);
+
+            documentService.deleteDocument(fileMd5, userId, role);
             
-            // 获取文件信息
-            Optional<FileUpload> fileOpt = fileUploadRepository.findByFileMd5AndUserId(fileMd5, userId);
-            if (fileOpt.isEmpty()) {
-                LogUtils.logUserOperation(userId, "DELETE_DOCUMENT", fileMd5, "FAILED_NOT_FOUND");
-                monitor.end("删除失败：文档不存在");
-                Map<String, Object> response = new HashMap<>();
-                response.put("code", HttpStatus.NOT_FOUND.value());
-                response.put("message", "文档不存在");
-                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
-            }
-            
-            FileUpload file = fileOpt.get();
-            
-            // 权限检查：只有文件所有者或管理员可以删除
-            if (!file.getUserId().equals(userId) && !"ADMIN".equals(role)) {
-                LogUtils.logUserOperation(userId, "DELETE_DOCUMENT", fileMd5, "FAILED_PERMISSION_DENIED");
-                LogUtils.logBusiness("DELETE_DOCUMENT", userId, "用户无权删除文档: fileMd5=%s, fileOwner=%s", fileMd5, file.getUserId());
-                monitor.end("删除失败：权限不足");
-                Map<String, Object> response = new HashMap<>();
-                response.put("code", HttpStatus.FORBIDDEN.value());
-                response.put("message", "没有权限删除此文档");
-                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
-            }
-            
-            // 执行删除操作
-            documentService.deleteDocument(fileMd5, userId);
-            
-            LogUtils.logFileOperation(userId, "DELETE", file.getFileName(), fileMd5, "SUCCESS");
+            LogUtils.logFileOperation(userId, "DELETE", fileMd5, fileMd5, "SUCCESS");
             monitor.end("文档删除成功");
             Map<String, Object> response = new HashMap<>();
             response.put("code", 200);
             response.put("message", "文档删除成功");
             return ResponseEntity.ok(response);
+        } catch (CustomException e) {
+            LogUtils.logUserOperation(userId, "DELETE_DOCUMENT", fileMd5, "FAILED_" + e.getStatus().value());
+            monitor.end("删除失败: " + e.getMessage());
+            Map<String, Object> response = new HashMap<>();
+            response.put("code", e.getStatus().value());
+            response.put("message", e.getMessage());
+            return ResponseEntity.status(e.getStatus()).body(response);
         } catch (Exception e) {
             LogUtils.logBusinessError("DELETE_DOCUMENT", userId, "删除文档失败: fileMd5=%s", e, fileMd5);
             monitor.end("删除失败: " + e.getMessage());

@@ -22,7 +22,7 @@ export const themeSettings: App.Theme.ThemeSetting = {
     mixChildMenuWidth: 200
   },
   footer: { visible: false, fixed: false, height: 48, right: true },
-  watermark: { visible: false, text: '派聪明 PaiSmart' },
+  watermark: { visible: false, text: '水利问答助手' },
   tokens: {
     light: {
       colors: {

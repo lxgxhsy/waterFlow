@@ -81,3 +81,12 @@ src/main/resources/application.yml~
 .env
 .env.*
 !.env.example
+
+# Local evaluation docs and helper scripts
+docs/eval/
+docs/error/
+docs/prd/
+scripts/
+
+
+.gitignore

@@ -2,6 +2,7 @@ package com.yizhaoqi.smartpai.utils;
 
 import com.yizhaoqi.smartpai.model.User;
 import com.yizhaoqi.smartpai.repository.UserRepository;
+import com.yizhaoqi.smartpai.service.TokenCacheService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -13,6 +14,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 
 /**
@@ -23,6 +25,9 @@ public class JwtUtilsRefreshTest {
 
     @Mock
     private UserRepository userRepository;
+
+    @Mock
+    private TokenCacheService tokenCacheService;
 
     @InjectMocks
     private JwtUtils jwtUtils;
@@ -45,6 +50,7 @@ public class JwtUtilsRefreshTest {
 
         // Mock用户仓库行为 (使用lenient模式避免不必要的stubbing警告)
         lenient().when(userRepository.findByUsername("testuser")).thenReturn(Optional.of(testUser));
+        lenient().when(tokenCacheService.isTokenValid(anyString())).thenReturn(true);
     }
 
     @Test

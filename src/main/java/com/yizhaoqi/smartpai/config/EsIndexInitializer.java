@@ -27,8 +27,16 @@ public class EsIndexInitializer implements CommandLineRunner {
     @Value("classpath:es-mappings/knowledge_base.json") // 加载 JSON 文件
     private org.springframework.core.io.Resource mappingResource;
 
+    @Value("${elasticsearch.index-initializer.enabled:true}")
+    private boolean indexInitializerEnabled;
+
     @Override
     public void run(String... args) throws Exception {
+        if (!indexInitializerEnabled) {
+            logger.info("Elasticsearch索引初始化已禁用");
+            return;
+        }
+
         try {
             initializeIndex();
         } catch (Exception exception) {

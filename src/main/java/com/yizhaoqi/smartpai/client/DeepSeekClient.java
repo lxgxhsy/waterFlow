@@ -135,7 +135,7 @@ public class DeepSeekClient {
         String refStart = promptCfg.getRefStart() != null ? promptCfg.getRefStart() : "<<REF>>";
         String refEnd = promptCfg.getRefEnd() != null ? promptCfg.getRefEnd() : "<<END>>";
         sysBuilder.append(refStart).append("\n");
-        sysBuilder.append("以下参考信息分为两部分：【知识库检索结果】为文档/规程条文，回答时可引用并标注来源编号；【知识图谱】为实体关系与约束，用于回答上下游、隶属关系等结构化问题。\n\n");
+        sysBuilder.append("以下为本轮检索到的知识库片段。回答事实性问题时，只能依据这些片段中的明确内容；历史对话只用于理解指代，不能作为事实来源。不要根据文件名、常识或猜测补充片段中没有出现的信息。\n\n");
 
         if (context != null && !context.isEmpty()) {
             sysBuilder.append(context);
@@ -153,8 +153,9 @@ public class DeepSeekClient {
         ));
         logger.debug("添加了系统消息，长度: {}", systemContent.length());
 
-        // 2. 追加历史消息（若有）
-        if (history != null && !history.isEmpty()) {
+        // 2. RAG 场景优先使用本轮检索结果，避免历史中的旧错误答案污染事实回答。
+        boolean hasKnowledgeContext = context != null && context.contains("【知识库检索结果】");
+        if (!hasKnowledgeContext && history != null && !history.isEmpty()) {
             messages.addAll(history);
         }
 

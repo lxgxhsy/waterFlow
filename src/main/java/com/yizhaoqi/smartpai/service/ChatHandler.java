@@ -9,6 +9,7 @@ import com.yizhaoqi.smartpai.dto.IntentResult;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.socket.TextMessage;
@@ -39,6 +40,9 @@ public class ChatHandler {
     private final ObjectMapper objectMapper;
     private final IntentRecognitionService intentRecognitionService;
     private final KnowledgeGraphService knowledgeGraphService;
+
+    @Value("${ai.knowledge-graph.enabled:false}")
+    private boolean knowledgeGraphEnabled;
 
     // 用于存储每个会话的完整响应
     private final Map<String, StringBuilder> responseBuilders = new ConcurrentHashMap<>();
@@ -81,19 +85,23 @@ public class ChatHandler {
             IntentResult intent = intentRecognitionService.recognize(userMessage);
             logger.info("意图识别结果: type={}, needRag={}, needKg={}", intent.getIntentType(), intent.needRag(), intent.needKg());
 
-            // 4. RAG 检索（按意图决定是否执行）
-            List<SearchResult> searchResults = intent.needRag()
+            // 4. RAG 检索。KG 未接入时，原本判为 KG 的实体/关系问题也回落到文档检索。
+            boolean shouldUseRag = intent.needRag()
+                    || (!knowledgeGraphEnabled && intent.needKg());
+            List<SearchResult> searchResults = shouldUseRag
                     ? searchService.searchWithPermission(userMessage, userId, 5)
                     : new ArrayList<>();
             logger.debug("RAG 搜索结果数量: {}", searchResults.size());
 
-            // 5. 知识图谱上下文（按意图决定是否查询）
-            String kgContext = intent.needKg()
+            // 5. 知识图谱未接入时默认关闭，避免把占位内容交给模型造成误导。
+            String kgContext = knowledgeGraphEnabled && intent.needKg()
                     ? knowledgeGraphService.getSubgraphContext(userMessage, intent.getSlots())
                     : "";
 
             // 6. 合并 RAG 与 KG 上下文
-            String context = mergeContext(buildContext(searchResults), kgContext);
+            String context = knowledgeGraphEnabled
+                    ? mergeContext(buildContext(searchResults), kgContext)
+                    : buildRagOnlyContext(searchResults);
 
             // 7. 调用 DeepSeek API 并处理流式响应
             logger.info("调用DeepSeek API生成回复");
@@ -314,18 +322,40 @@ public class ChatHandler {
             return "";
         }
 
-        final int MAX_SNIPPET_LEN = 300; // 单段最长字符数，超出截断
+        final int MAX_SNIPPET_LEN = 900; // 单段最长字符数，保留足够事实细节
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < searchResults.size(); i++) {
             SearchResult result = searchResults.get(i);
-            String snippet = result.getTextContent();
+            String snippet = cleanSnippet(result.getTextContent());
+            if (snippet == null || snippet.isBlank()) {
+                continue;
+            }
             if (snippet.length() > MAX_SNIPPET_LEN) {
                 snippet = snippet.substring(0, MAX_SNIPPET_LEN) + "…";
             }
             String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
-            context.append(String.format("[%d] (%s) %s\n", i + 1, fileLabel, snippet));
+            context.append(String.format("来源#%d: %s%n摘录: %s%n%n", i + 1, fileLabel, snippet));
         }
         return context.toString();
+    }
+
+    private String buildRagOnlyContext(List<SearchResult> searchResults) {
+        String ragContext = buildContext(searchResults);
+        if (ragContext == null || ragContext.isBlank()) {
+            return "";
+        }
+        return "【知识库检索结果】\n" + ragContext;
+    }
+
+    private String cleanSnippet(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text
+                .replaceAll("\\.{8,}", " ")
+                .replaceAll("[ \\t\\x0B\\f\\r]+", " ")
+                .replaceAll("\\n{3,}", "\n\n")
+                .trim();
     }
 
     /**

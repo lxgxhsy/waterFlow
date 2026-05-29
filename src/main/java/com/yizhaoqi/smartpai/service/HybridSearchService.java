@@ -15,7 +15,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import co.elastic.clients.elasticsearch._types.query_dsl.Operator;
 
 import java.util.Collections;
 import java.util.List;
@@ -74,6 +73,8 @@ public class HybridSearchService {
 
             // 生成查询向量
             final List<Float> queryVector = embedToVectorList(query);
+            final String recallQuery = expandQueryForRecall(query);
+            logger.debug("检索召回查询: {}", recallQuery);
 
             // 如果向量生成失败，仅使用文本匹配
             if (queryVector == null) {
@@ -95,7 +96,7 @@ public class HybridSearchService {
                         );
                         // 必须命中关键词 + 权限过滤
                         s.query(q -> q.bool(b -> b
-                                .must(mst -> mst.match(m -> m.field("textContent").query(query)))
+                                .must(mst -> mst.match(m -> m.field("textContent").query(recallQuery)))
                                 .filter(f -> f.bool(bf -> bf
                                         // 条件1: 用户可访问自己的文档
                                         .should(s1 -> s1.term(t -> t.field("userId").value(userDbId)))
@@ -125,8 +126,7 @@ public class HybridSearchService {
                                         .rescoreQueryWeight(1.0d)        // BM25 主导
                                         .query(rqq -> rqq.match(m -> m
                                                 .field("textContent")
-                                                .query(query)
-                                                .operator(Operator.And)
+                                                .query(recallQuery)
                                         ))
                                 )
                         );
@@ -177,6 +177,8 @@ public class HybridSearchService {
     private List<SearchResult> textOnlySearchWithPermission(String query, String userDbId, List<String> userEffectiveTags, int topK) {
         try {
             logger.debug("开始执行纯文本搜索，用户数据库ID: {}, 标签: {}", userDbId, userEffectiveTags);
+            final String recallQuery = expandQueryForRecall(query);
+            logger.debug("纯文本召回查询: {}", recallQuery);
 
             SearchResponse<EsDocument> response = esClient.search(s -> s
                     .index("knowledge_base")
@@ -186,7 +188,7 @@ public class HybridSearchService {
                                     .must(m -> m
                                             .match(ma -> ma
                                                     .field("textContent")
-                                                    .query(query)
+                                                    .query(recallQuery)
                                             )
                                     )
                                     // 权限过滤
@@ -278,6 +280,8 @@ public class HybridSearchService {
 
             // 生成查询向量
             final List<Float> queryVector = embedToVectorList(query);
+            final String recallQuery = expandQueryForRecall(query);
+            logger.debug("检索召回查询: {}", recallQuery);
             
             // 如果向量生成失败，仅使用文本匹配
             if (queryVector == null) {
@@ -296,7 +300,7 @@ public class HybridSearchService {
                         );
 
                         // 过滤仅保留包含关键词的文本
-                        s.query(q -> q.match(m -> m.field("textContent").query(query)));
+                        s.query(q -> q.match(m -> m.field("textContent").query(recallQuery)));
 
                         // rescore BM25
                         s.rescore(r -> r
@@ -306,8 +310,7 @@ public class HybridSearchService {
                                         .rescoreQueryWeight(1.0d)
                                         .query(rqq -> rqq.match(m -> m
                                                 .field("textContent")
-                                                .query(query)
-                                                .operator(Operator.And)
+                                                .query(recallQuery)
                                         ))
                                 )
                         );
@@ -343,12 +346,13 @@ public class HybridSearchService {
      * 仅使用文本匹配的搜索方法
      */
     private List<SearchResult> textOnlySearch(String query, int topK) throws Exception {
+        final String recallQuery = expandQueryForRecall(query);
         SearchResponse<EsDocument> response = esClient.search(s -> s
                 .index("knowledge_base")
                 .query(q -> q
                         .match(m -> m
                                 .field("textContent")
-                                .query(query)
+                                .query(recallQuery)
                         )
                 )
                 .size(topK),
@@ -366,6 +370,90 @@ public class HybridSearchService {
                     );
                 })
                 .toList();
+    }
+
+    String expandQueryForRecall(String query) {
+        if (query == null || query.isBlank()) {
+            return query;
+        }
+
+        List<String> terms = new ArrayList<>();
+        String normalized = query.trim();
+        terms.add(normalized);
+
+        addTermsIfTriggered(
+                terms,
+                normalized,
+                new String[]{"原则", "规则", "要求", "调度原则", "运行原则", "控制原则", "总控制", "分期控制", "怎么运行", "如何运行", "怎么调度", "如何调度"},
+                new String[]{"调度原则", "运行原则", "控制原则", "总控制原则", "分期控制原则", "防洪为主", "兼顾发电"}
+        );
+
+        addTermsIfTriggered(
+                terms,
+                normalized,
+                new String[]{"水位", "汛限", "限制水位", "蓄水位", "死水位", "库水位", "梅汛", "台汛", "非汛", "汛期", "兴利下限"},
+                new String[]{"汛限水位", "限制水位", "梅汛期", "台汛期", "非汛期", "正常蓄水位", "死水位"}
+        );
+
+        addTermsIfTriggered(
+                terms,
+                normalized,
+                new String[]{"开闸", "放水", "泄洪", "泄流", "下泄", "预泄", "放空", "闸门", "满发", "操作", "怎么处理", "如何处理", "大降雨", "台风", "暴雨"},
+                new String[]{"开闸", "放水", "泄洪", "预泄", "放空管", "电站满发"}
+        );
+
+        addTermsIfTriggered(
+                terms,
+                normalized,
+                new String[]{"保护对象", "行政村", "村", "责任人", "巡查", "联系人", "联系方式", "电话", "手机"},
+                new String[]{"防洪保护对象", "行政村", "巡查责任人", "联系方式"}
+        );
+
+        if (containsAny(normalized, "位置", "位于", "哪里", "在哪", "地点", "坐标", "坝址")) {
+            terms.add("位于");
+            terms.add("所在");
+            terms.add("地处");
+            terms.add("坝址");
+            terms.add("支流");
+            terms.add("上游");
+        }
+
+        if (containsAny(normalized, "流域", "水系")) {
+            terms.add("流域");
+            terms.add("支流");
+            terms.add("主流");
+            terms.add("发源");
+            terms.add("注入");
+            terms.add("面积");
+        }
+
+        if (containsAny(normalized, "概况", "介绍", "简介", "基本情况")) {
+            terms.add("基本情况");
+            terms.add("水库概况");
+            terms.add("工程情况");
+            terms.add("控制运行计划");
+        }
+
+        return terms.stream()
+                .filter(term -> term != null && !term.isBlank())
+                .distinct()
+                .collect(Collectors.joining(" "));
+    }
+
+    private void addTermsIfTriggered(List<String> terms, String query, String[] triggers, String[] expandedTerms) {
+        if (!containsAny(query, triggers)) {
+            return;
+        }
+        Collections.addAll(terms, expandedTerms);
+    }
+
+    private boolean containsAny(String text, String... candidates) {
+        for (String candidate : candidates) {
+            if (text.contains(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

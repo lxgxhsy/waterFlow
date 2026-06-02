@@ -88,5 +88,8 @@ docs/error/
 docs/prd/
 scripts/
 
+# AI agent mailbox (local review/fix loop, not versioned)
+.ai/
+
 
 .gitignore

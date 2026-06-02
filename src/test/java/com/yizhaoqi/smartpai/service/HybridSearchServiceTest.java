@@ -1,8 +1,12 @@
 package com.yizhaoqi.smartpai.service;
 
+import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 
 class HybridSearchServiceTest {
 
@@ -46,12 +50,18 @@ class HybridSearchServiceTest {
                 .contains("分期控制原则")
                 .contains("防洪为主")
                 .contains("兼顾发电")
+                .contains("兴利")
+                .contains("灌溉")
                 .doesNotContain("开闸")
                 .doesNotContain("放水")
                 .doesNotContain("泄洪")
                 .doesNotContain("预泄")
                 .doesNotContain("放空管")
-                .doesNotContain("电站满发");
+                .doesNotContain("电站满发")
+                .doesNotContain("调蓄")
+                .doesNotContain("降低水位")
+                .doesNotContain("溢洪道")
+                .doesNotContain("闸门");
     }
 
     @Test
@@ -62,11 +72,17 @@ class HybridSearchServiceTest {
                 .contains("汛限水位是多少？")
                 .contains("汛限水位")
                 .contains("限制水位")
+                .contains("控制水位")
+                .contains("库水位")
                 .contains("梅汛期")
                 .contains("台汛期")
                 .contains("非汛期")
                 .contains("正常蓄水位")
-                .contains("死水位");
+                .contains("死水位")
+                .contains("307.00m")
+                .contains("310.00m")
+                .contains("314.00m")
+                .contains("298.00m");
     }
 
     @Test
@@ -79,8 +95,29 @@ class HybridSearchServiceTest {
                 .contains("放水")
                 .contains("泄洪")
                 .contains("预泄")
-                .contains("放空管")
-                .contains("电站满发");
+                .contains("调蓄")
+                .contains("降低水位")
+                .contains("溢洪道")
+                .contains("闸门")
+                .doesNotContain("放空管")
+                .doesNotContain("电站满发");
+    }
+
+    @Test
+    void doesNotTriggerOperationExpansionForGenericHandlingWords() {
+        String expanded = service.expandQueryForRecall("水库出现问题怎么处理？");
+
+        assertThat(expanded)
+                .doesNotContain("开闸")
+                .doesNotContain("放水")
+                .doesNotContain("泄洪")
+                .doesNotContain("预泄")
+                .doesNotContain("放空管")
+                .doesNotContain("电站满发")
+                .doesNotContain("调蓄")
+                .doesNotContain("降低水位")
+                .doesNotContain("溢洪道")
+                .doesNotContain("闸门");
     }
 
     @Test
@@ -100,5 +137,90 @@ class HybridSearchServiceTest {
         String expanded = service.expandQueryForRecall("木瓜水库总库容是多少？");
 
         assertThat(expanded).isEqualTo("木瓜水库总库容是多少？");
+    }
+
+    @Test
+    void mergesBm25AndVectorResultsByRrfRankAndStableChunkKey() {
+        SearchResult bm25A = result("file-a", 1);
+        SearchResult bm25B = result("file-b", 2);
+        SearchResult bm25C = result("file-c", 3);
+        SearchResult vectorB = result("file-b", 2);
+        SearchResult vectorD = result("file-d", 4);
+        SearchResult vectorA = result("file-a", 1);
+
+        List<SearchResult> merged = service.mergeByRrf(
+                List.of(bm25A, bm25B, bm25C),
+                List.of(vectorB, vectorD, vectorA),
+                4
+        );
+
+        assertThat(merged)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-b:2", "file-a:1", "file-d:4", "file-c:3");
+        assertThat(merged).hasSize(4);
+        assertThat(merged.get(0).getScore()).isCloseTo(
+                (1.0d / (60 + 1)) + (0.8d / (60 + 2)),
+                within(1.0e-10)
+        );
+        assertThat(merged.get(0).getScore()).isGreaterThan(merged.get(1).getScore());
+        assertThat(bm25B.getScore()).isEqualTo(0.0d);
+        assertThat(vectorB.getScore()).isEqualTo(0.0d);
+    }
+
+    @Test
+    void rrfMergeUsesFirstRankOnlyForDuplicateWithinSameRoute() {
+        SearchResult first = result("file-a", 1);
+        SearchResult duplicate = result("file-a", 1);
+        SearchResult second = result("file-b", 2);
+
+        List<SearchResult> merged = service.mergeByRrf(
+                List.of(first, duplicate, second),
+                List.of(),
+                10
+        );
+
+        assertThat(merged)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-a:1", "file-b:2");
+    }
+
+    @Test
+    void rrfMergeTruncatesToTopK() {
+        List<SearchResult> merged = service.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2), result("file-c", 3)),
+                List.of(result("file-d", 4)),
+                2
+        );
+
+        assertThat(merged)
+                .hasSize(2)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-d:4", "file-a:1");
+        assertThat(merged.get(0).getScore()).isGreaterThan(merged.get(1).getScore());
+    }
+
+    @Test
+    void rrfMergeReturnsEmptyForEmptyInputs() {
+        List<SearchResult> merged = service.mergeByRrf(List.of(), List.of(), 10);
+
+        assertThat(merged).isEmpty();
+    }
+
+    @Test
+    void rrfRankStartsAtOne() {
+        List<SearchResult> merged = service.mergeByRrf(
+                List.of(result("file-a", 1)),
+                List.of(),
+                10
+        );
+
+        assertThat(merged)
+                .singleElement()
+                .extracting(SearchResult::getScore)
+                .isEqualTo(0.8d / (60 + 1));
+    }
+
+    private SearchResult result(String fileMd5, int chunkId) {
+        return new SearchResult(fileMd5, chunkId, "content-" + chunkId, 0.0d);
     }
 }

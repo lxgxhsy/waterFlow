@@ -2,6 +2,8 @@ package com.yizhaoqi.smartpai.service;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.core.search.Hit;
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import com.yizhaoqi.smartpai.client.EmbeddingClient;
 import com.yizhaoqi.smartpai.entity.EsDocument;
 import com.yizhaoqi.smartpai.entity.SearchResult;
@@ -21,6 +23,9 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Set;
 import java.util.Map;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -31,6 +36,12 @@ import java.util.stream.Collectors;
 public class HybridSearchService {
 
     private static final Logger logger = LoggerFactory.getLogger(HybridSearchService.class);
+    private static final int BM25_RECALL_MULTIPLIER = 20;
+    private static final int VECTOR_RECALL_MULTIPLIER = 30;
+    private static final int VECTOR_NUM_CANDIDATE_MULTIPLIER = 50;
+    private static final int RRF_RANK_CONSTANT = 60;
+    private static final double RRF_BM25_WEIGHT = 0.8d;
+    private static final double RRF_VECTOR_WEIGHT = 1.0d;
 
     @Autowired
     private ElasticsearchClient esClient;
@@ -71,90 +82,25 @@ public class HybridSearchService {
             String userDbId = getUserDbId(userId);
             logger.debug("用户 {} 的数据库ID: {}", userId, userDbId);
 
-            // 生成查询向量
-            final List<Float> queryVector = embedToVectorList(query);
             final String recallQuery = expandQueryForRecall(query);
             logger.debug("检索召回查询: {}", recallQuery);
+            int resultK = normalizeTopK(topK);
+            int bm25RecallK = bm25RecallK(resultK);
+            int vectorRecallK = vectorRecallK(resultK);
 
-            // 如果向量生成失败，仅使用文本匹配
+            final List<Float> queryVector = embedToVectorList(query);
             if (queryVector == null) {
-                logger.warn("向量生成失败，仅使用文本匹配进行搜索");
-                return textOnlySearchWithPermission(query, userDbId, userEffectiveTags, topK);
+                logger.warn("向量生成失败，回退到纯 BM25 搜索");
+                return textOnlySearchWithPermission(query, userDbId, userEffectiveTags, resultK);
             }
 
-            logger.debug("向量生成成功，开始执行混合搜索 KNN");
+            List<SearchResult> bm25Results = searchBm25WithPermission(recallQuery, userDbId, userEffectiveTags, bm25RecallK);
+            logger.debug("BM25 召回完成，候选数量: {}", bm25Results.size());
 
-            SearchResponse<EsDocument> response = esClient.search(s -> {
-                        s.index("knowledge_base");
-                        // KNN 召回
-                        int recallK = topK * 30; // KNN 召回窗口
-                        s.knn(kn -> kn
-                                .field("vector")
-                                .queryVector(queryVector)
-                                .k(recallK)
-                                .numCandidates(recallK)
-                        );
-                        // 必须命中关键词 + 权限过滤
-                        s.query(q -> q.bool(b -> b
-                                .must(mst -> mst.match(m -> m.field("textContent").query(recallQuery)))
-                                .filter(f -> f.bool(bf -> bf
-                                        // 条件1: 用户可访问自己的文档
-                                        .should(s1 -> s1.term(t -> t.field("userId").value(userDbId)))
-                                        // 条件2: 公开文档
-                                        .should(s2 -> s2.term(t -> t.field("public").value(true)))
-                                        // 条件3: 组织标签
-                                        .should(s3 -> {
-                                            if (userEffectiveTags.isEmpty()) {
-                                                return s3.matchNone(mn -> mn);
-                                            } else if (userEffectiveTags.size() == 1) {
-                                                return s3.term(t -> t.field("orgTag").value(userEffectiveTags.get(0)));
-                                            } else {
-                                                return s3.bool(inner -> {
-                                                    userEffectiveTags.forEach(tag -> inner.should(sh2 -> sh2.term(t -> t.field("orgTag").value(tag))));
-                                                    return inner;
-                                                });
-                                            }
-                                        })
-                                ))
-                        ));
+            List<SearchResult> vectorResults = searchVectorWithPermission(queryVector, userDbId, userEffectiveTags, vectorRecallK);
+            logger.debug("向量召回完成，候选数量: {}", vectorResults.size());
 
-                        // 第二阶段 BM25 rescore
-                        s.rescore(r -> r
-                                .windowSize(recallK)
-                                .query(rq -> rq
-                                        .queryWeight(0.2d)               // 保留部分 KNN 分
-                                        .rescoreQueryWeight(1.0d)        // BM25 主导
-                                        .query(rqq -> rqq.match(m -> m
-                                                .field("textContent")
-                                                .query(recallQuery)
-                                        ))
-                                )
-                        );
-                        s.size(topK);
-                        return s;
-                    }, EsDocument.class);
-
-            logger.debug("Elasticsearch查询执行完成，命中数量: {}, 最大分数: {}", 
-                response.hits().total().value(), response.hits().maxScore());
-
-            List<SearchResult> results = response.hits().hits().stream()
-                    .map(hit -> {
-                        assert hit.source() != null;
-                        logger.debug("搜索结果 - 文件: {}, 块: {}, 分数: {}, 内容: {}", 
-                            hit.source().getFileMd5(), hit.source().getChunkId(), hit.score(), 
-                            hit.source().getTextContent().substring(0, Math.min(50, hit.source().getTextContent().length())));
-                        return new SearchResult(
-                                hit.source().getFileMd5(),
-                                hit.source().getChunkId(),
-                                hit.source().getTextContent(),
-                                hit.score(),
-                                hit.source().getUserId(),
-                                hit.source().getOrgTag(),
-                                hit.source().isPublic()
-                        );
-                    })
-                    .toList();
-
+            List<SearchResult> results = mergeByRrf(bm25Results, vectorResults, resultK);
             logger.debug("返回搜索结果数量: {}", results.size());
             attachFileNames(results);
             return results;
@@ -179,88 +125,11 @@ public class HybridSearchService {
             logger.debug("开始执行纯文本搜索，用户数据库ID: {}, 标签: {}", userDbId, userEffectiveTags);
             final String recallQuery = expandQueryForRecall(query);
             logger.debug("纯文本召回查询: {}", recallQuery);
-
-            SearchResponse<EsDocument> response = esClient.search(s -> s
-                    .index("knowledge_base")
-                    .query(q -> q
-                            .bool(b -> b
-                                    // 匹配内容相关性
-                                    .must(m -> m
-                                            .match(ma -> ma
-                                                    .field("textContent")
-                                                    .query(recallQuery)
-                                            )
-                                    )
-                                    // 权限过滤
-                                    .filter(f -> f
-                                            .bool(bf -> bf
-                                                    // 条件1: 用户可以访问自己的文档
-                                                    .should(s1 -> s1
-                                                            .term(t -> t
-                                                                    .field("userId")
-                                                                    .value(userDbId)
-                                                            )
-                                                    )
-                                                    // 条件2: 用户可以访问公开的文档
-                                                    .should(s2 -> s2
-                                                            .term(t -> t
-                                                                    .field("public")
-                                                                    .value(true)
-                                                            )
-                                                    )
-                                                    // 条件3: 用户可以访问其所属组织的文档（包含层级关系）
-                                                    .should(s3 -> {
-                                                        if (userEffectiveTags.isEmpty()) {
-                                                            return s3.matchNone(mn -> mn);
-                                                        } else if (userEffectiveTags.size() == 1) {
-                                                            // 单个标签使用 term 查询
-                                                            return s3.term(t -> t
-                                                                    .field("orgTag")
-                                                                    .value(userEffectiveTags.get(0))
-                                                            );
-                                                        } else {
-                                                            // 多个标签使用 bool should 组合多个 term 查询
-                                                            return s3.bool(innerBool -> {
-                                                                userEffectiveTags.forEach(tag ->
-                                                                        innerBool.should(sh -> sh.term(t -> t
-                                                                                .field("orgTag")
-                                                                                .value(tag)
-                                                                        ))
-                                                                );
-                                                                return innerBool;
-                                                            });
-                                                        }
-                                                    })
-                                            )
-                                    )
-                            )
-                    )
-                    .minScore(0.3d)
-                    .size(topK),
-                    EsDocument.class
+            int resultK = normalizeTopK(topK);
+            List<SearchResult> results = limitResults(
+                    searchBm25WithPermission(recallQuery, userDbId, userEffectiveTags, bm25RecallK(resultK)),
+                    resultK
             );
-
-            logger.debug("纯文本查询执行完成，命中数量: {}, 最大分数: {}", 
-                response.hits().total().value(), response.hits().maxScore());
-
-            List<SearchResult> results = response.hits().hits().stream()
-                    .map(hit -> {
-                        assert hit.source() != null;
-                        logger.debug("纯文本搜索结果 - 文件: {}, 块: {}, 分数: {}, 内容: {}", 
-                            hit.source().getFileMd5(), hit.source().getChunkId(), hit.score(), 
-                            hit.source().getTextContent().substring(0, Math.min(50, hit.source().getTextContent().length())));
-                        return new SearchResult(
-                                hit.source().getFileMd5(),
-                                hit.source().getChunkId(),
-                                hit.source().getTextContent(),
-                                hit.score(),
-                                hit.source().getUserId(),
-                                hit.source().getOrgTag(),
-                                hit.source().isPublic()
-                        );
-                    })
-                    .toList();
-
             logger.debug("返回纯文本搜索结果数量: {}", results.size());
             attachFileNames(results);
             return results;
@@ -278,57 +147,27 @@ public class HybridSearchService {
             logger.debug("开始混合检索，查询: {}, topK: {}", query, topK);
             logger.warn("使用了没有权限过滤的搜索方法，建议使用 searchWithPermission 方法");
 
-            // 生成查询向量
-            final List<Float> queryVector = embedToVectorList(query);
             final String recallQuery = expandQueryForRecall(query);
             logger.debug("检索召回查询: {}", recallQuery);
+            int resultK = normalizeTopK(topK);
+            int bm25RecallK = bm25RecallK(resultK);
+            int vectorRecallK = vectorRecallK(resultK);
             
-            // 如果向量生成失败，仅使用文本匹配
+            final List<Float> queryVector = embedToVectorList(query);
             if (queryVector == null) {
-                logger.warn("向量生成失败，仅使用文本匹配进行搜索");
-                return textOnlySearch(query, topK);
+                logger.warn("向量生成失败，回退到纯 BM25 搜索");
+                return textOnlySearch(query, resultK);
             }
 
-            SearchResponse<EsDocument> response = esClient.search(s -> {
-                        s.index("knowledge_base");
-                        int recallK = topK * 30;
-                        s.knn(kn -> kn
-                                .field("vector")
-                                .queryVector(queryVector)
-                                .k(recallK)
-                                .numCandidates(recallK)
-                        );
+            List<SearchResult> bm25Results = searchBm25WithPermission(recallQuery, null, Collections.emptyList(), bm25RecallK);
+            logger.debug("BM25 召回完成，候选数量: {}", bm25Results.size());
 
-                        // 过滤仅保留包含关键词的文本
-                        s.query(q -> q.match(m -> m.field("textContent").query(recallQuery)));
+            List<SearchResult> vectorResults = searchVectorWithPermission(queryVector, null, Collections.emptyList(), vectorRecallK);
+            logger.debug("向量召回完成，候选数量: {}", vectorResults.size());
 
-                        // rescore BM25
-                        s.rescore(r -> r
-                                .windowSize(recallK)
-                                .query(rq -> rq
-                                        .queryWeight(0.2d)
-                                        .rescoreQueryWeight(1.0d)
-                                        .query(rqq -> rqq.match(m -> m
-                                                .field("textContent")
-                                                .query(recallQuery)
-                                        ))
-                                )
-                        );
-                        s.size(topK);
-                        return s;
-                    }, EsDocument.class);
-
-            return response.hits().hits().stream()
-                    .map(hit -> {
-                        assert hit.source() != null;
-                        return new SearchResult(
-                                hit.source().getFileMd5(),
-                                hit.source().getChunkId(),
-                                hit.source().getTextContent(),
-                                hit.score()
-                        );
-                    })
-                    .toList();
+            List<SearchResult> results = mergeByRrf(bm25Results, vectorResults, resultK);
+            attachFileNames(results);
+            return results;
         } catch (Exception e) {
             logger.error("搜索失败", e);
             // 发生异常时尝试使用纯文本搜索作为后备方案
@@ -347,29 +186,218 @@ public class HybridSearchService {
      */
     private List<SearchResult> textOnlySearch(String query, int topK) throws Exception {
         final String recallQuery = expandQueryForRecall(query);
+        int resultK = normalizeTopK(topK);
+        List<SearchResult> results = limitResults(
+                searchBm25WithPermission(recallQuery, null, Collections.emptyList(), bm25RecallK(resultK)),
+                resultK
+        );
+        attachFileNames(results);
+        return results;
+    }
+
+    private List<SearchResult> searchBm25WithPermission(String recallQuery,
+                                                        String userDbId,
+                                                        List<String> userEffectiveTags,
+                                                        int recallK) throws Exception {
+        Query permissionQuery = buildPermissionQuery(userDbId, userEffectiveTags);
         SearchResponse<EsDocument> response = esClient.search(s -> s
                 .index("knowledge_base")
                 .query(q -> q
-                        .match(m -> m
-                                .field("textContent")
-                                .query(recallQuery)
+                        .bool(b -> b
+                                .must(m -> m.match(ma -> ma
+                                        .field("textContent")
+                                        .query(recallQuery)
+                                ))
+                                .filter(permissionQuery)
                         )
                 )
-                .size(topK),
+                .size(recallK),
                 EsDocument.class
         );
 
-        return response.hits().hits().stream()
-                .map(hit -> {
-                    assert hit.source() != null;
-                    return new SearchResult(
-                            hit.source().getFileMd5(),
-                            hit.source().getChunkId(),
-                            hit.source().getTextContent(),
-                            hit.score()
-                    );
-                })
+        return toSearchResults(response);
+    }
+
+    private List<SearchResult> searchVectorWithPermission(List<Float> queryVector,
+                                                          String userDbId,
+                                                          List<String> userEffectiveTags,
+                                                          int recallK) throws Exception {
+        Query permissionQuery = buildPermissionQuery(userDbId, userEffectiveTags);
+        SearchResponse<EsDocument> response = esClient.search(s -> s
+                .index("knowledge_base")
+                .knn(kn -> kn
+                        .field("vector")
+                        .queryVector(queryVector)
+                        .k(recallK)
+                        .numCandidates(vectorNumCandidatesK(recallK))
+                        .filter(permissionQuery)
+                )
+                .size(recallK),
+                EsDocument.class
+        );
+
+        return toSearchResults(response);
+    }
+
+    private Query buildPermissionQuery(String userDbId, List<String> userEffectiveTags) {
+        boolean hasUser = userDbId != null && !userDbId.isBlank();
+        boolean hasTags = userEffectiveTags != null && !userEffectiveTags.isEmpty();
+        if (!hasUser && !hasTags) {
+            return Query.of(q -> q.matchAll(m -> m));
+        }
+
+        return Query.of(q -> q.bool(b -> {
+            if (hasUser) {
+                b.should(s -> s.term(t -> t.field("userId").value(userDbId)));
+            }
+            b.should(s -> s.term(t -> t.field("isPublic").value(true)));
+
+            if (hasTags) {
+                if (userEffectiveTags.size() == 1) {
+                    b.should(s -> s.term(t -> t.field("orgTag").value(userEffectiveTags.get(0))));
+                } else {
+                    b.should(s -> s.bool(inner -> {
+                        userEffectiveTags.forEach(tag ->
+                                inner.should(sh -> sh.term(t -> t.field("orgTag").value(tag)))
+                        );
+                        inner.minimumShouldMatch("1");
+                        return inner;
+                    }));
+                }
+            }
+
+            b.minimumShouldMatch("1");
+            return b;
+        }));
+    }
+
+    List<SearchResult> mergeByRrf(List<SearchResult> bm25Results, List<SearchResult> vectorResults, int topK) {
+        Map<String, RrfCandidate> candidates = new LinkedHashMap<>();
+        addRrfScores(candidates, bm25Results, RRF_BM25_WEIGHT);
+        addRrfScores(candidates, vectorResults, RRF_VECTOR_WEIGHT);
+
+        return candidates.values().stream()
+                .sorted(Comparator.comparingDouble(RrfCandidate::score).reversed())
+                .limit(normalizeTopK(topK))
+                .map(candidate -> copyWithScore(candidate.result(), candidate.score()))
                 .toList();
+    }
+
+    private void addRrfScores(Map<String, RrfCandidate> candidates, List<SearchResult> results, double weight) {
+        if (results == null || results.isEmpty()) {
+            return;
+        }
+
+        Set<String> seenInRoute = new HashSet<>();
+        for (int i = 0; i < results.size(); i++) {
+            SearchResult result = results.get(i);
+            String key = resultKey(result);
+            if (key == null || !seenInRoute.add(key)) {
+                continue;
+            }
+
+            int rank = i + 1;
+            double score = weight / (RRF_RANK_CONSTANT + rank);
+            candidates.compute(key, (ignored, candidate) -> {
+                if (candidate == null) {
+                    return new RrfCandidate(result, score);
+                }
+                candidate.addScore(score);
+                return candidate;
+            });
+        }
+    }
+
+    private String resultKey(SearchResult result) {
+        if (result == null || result.getFileMd5() == null || result.getChunkId() == null) {
+            return null;
+        }
+        return result.getFileMd5() + ":" + result.getChunkId();
+    }
+
+    private SearchResult copyWithScore(SearchResult source, double score) {
+        return new SearchResult(
+                source.getFileMd5(),
+                source.getChunkId(),
+                source.getTextContent(),
+                score,
+                source.getUserId(),
+                source.getOrgTag(),
+                Boolean.TRUE.equals(source.getIsPublic()),
+                source.getFileName()
+        );
+    }
+
+    private List<SearchResult> toSearchResults(SearchResponse<EsDocument> response) {
+        return response.hits().hits().stream()
+                .map(this::toSearchResult)
+                .toList();
+    }
+
+    private SearchResult toSearchResult(Hit<EsDocument> hit) {
+        assert hit.source() != null;
+        EsDocument source = hit.source();
+        logger.debug("搜索候选 - 文件: {}, 块: {}, 分数: {}, 内容: {}",
+                source.getFileMd5(),
+                source.getChunkId(),
+                hit.score(),
+                source.getTextContent() == null ? "" : source.getTextContent().substring(0, Math.min(50, source.getTextContent().length())));
+        return new SearchResult(
+                source.getFileMd5(),
+                source.getChunkId(),
+                source.getTextContent(),
+                hit.score(),
+                source.getUserId(),
+                source.getOrgTag(),
+                source.isPublic()
+        );
+    }
+
+    private List<SearchResult> limitResults(List<SearchResult> results, int topK) {
+        return results.stream()
+                .limit(normalizeTopK(topK))
+                .toList();
+    }
+
+    private int normalizeTopK(int topK) {
+        return Math.max(1, topK);
+    }
+
+    private int bm25RecallK(int topK) {
+        return normalizeTopK(topK) * BM25_RECALL_MULTIPLIER;
+    }
+
+    private int vectorRecallK(int topK) {
+        return normalizeTopK(topK) * VECTOR_RECALL_MULTIPLIER;
+    }
+
+    private int vectorNumCandidatesK(int vectorRecallK) {
+        return Math.max(
+                normalizeTopK(vectorRecallK),
+                (int) Math.ceil((double) normalizeTopK(vectorRecallK) * VECTOR_NUM_CANDIDATE_MULTIPLIER / VECTOR_RECALL_MULTIPLIER)
+        );
+    }
+
+    private static class RrfCandidate {
+        private final SearchResult result;
+        private double score;
+
+        private RrfCandidate(SearchResult result, double score) {
+            this.result = result;
+            this.score = score;
+        }
+
+        private SearchResult result() {
+            return result;
+        }
+
+        private double score() {
+            return score;
+        }
+
+        private void addScore(double score) {
+            this.score += score;
+        }
     }
 
     String expandQueryForRecall(String query) {
@@ -385,21 +413,21 @@ public class HybridSearchService {
                 terms,
                 normalized,
                 new String[]{"原则", "规则", "要求", "调度原则", "运行原则", "控制原则", "总控制", "分期控制", "怎么运行", "如何运行", "怎么调度", "如何调度"},
-                new String[]{"调度原则", "运行原则", "控制原则", "总控制原则", "分期控制原则", "防洪为主", "兼顾发电"}
+                new String[]{"调度原则", "运行原则", "控制原则", "总控制原则", "分期控制原则", "防洪为主", "兼顾发电", "兴利", "灌溉"}
         );
 
         addTermsIfTriggered(
                 terms,
                 normalized,
                 new String[]{"水位", "汛限", "限制水位", "蓄水位", "死水位", "库水位", "梅汛", "台汛", "非汛", "汛期", "兴利下限"},
-                new String[]{"汛限水位", "限制水位", "梅汛期", "台汛期", "非汛期", "正常蓄水位", "死水位"}
+                new String[]{"汛限水位", "限制水位", "控制水位", "库水位", "梅汛期", "台汛期", "非汛期", "正常蓄水位", "死水位", "307.00m", "310.00m", "314.00m", "298.00m"}
         );
 
         addTermsIfTriggered(
                 terms,
                 normalized,
-                new String[]{"开闸", "放水", "泄洪", "泄流", "下泄", "预泄", "放空", "闸门", "满发", "操作", "怎么处理", "如何处理", "大降雨", "台风", "暴雨"},
-                new String[]{"开闸", "放水", "泄洪", "预泄", "放空管", "电站满发"}
+                new String[]{"开闸", "放水", "泄洪", "泄流", "下泄", "预泄", "放空", "闸门", "满发", "大降雨", "台风", "暴雨"},
+                new String[]{"开闸", "放水", "泄洪", "预泄", "调蓄", "降低水位", "溢洪道", "闸门"}
         );
 
         addTermsIfTriggered(

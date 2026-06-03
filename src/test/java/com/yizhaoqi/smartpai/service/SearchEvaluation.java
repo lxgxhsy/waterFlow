@@ -1,10 +1,11 @@
 package com.yizhaoqi.smartpai.service;
 
+import com.yizhaoqi.smartpai.SmartPaiApplication;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.junit.jupiter.api.Disabled;
+import org.springframework.boot.SpringApplication;
+import org.springframework.context.ConfigurableApplicationContext;
 
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -16,16 +17,6 @@ import java.util.stream.Collectors;
 public class SearchEvaluation {
 
     private static final int REPORT_TOP_K = 10;
-    private static final List<SearchResult> PRD_ACCEPTANCE_FIXTURES = List.of(
-            result("prd93-principle:1", "木瓜水库调度原则为防洪为主，兼顾发电、灌溉和兴利综合利用。"),
-            result("prd93-principle:2", "运行原则包括总控制原则和分期控制原则，汛期按限制水位和预报雨情调度。"),
-            result("prd93-water-level:1", "木瓜水库汛限水位按汛期分段控制，梅汛期限制水位为307.00m，台汛期限制水位为310.00m。"),
-            result("prd93-water-level:2", "梅汛期水库限制水位为307.00m，超过控制水位时应及时预泄。"),
-            result("prd93-water-level:3", "台汛期限制水位为310.00m，正常蓄水位314.00m，死水位298.00m。"),
-            result("prd93-operation:1", "非汛期水库按兴利下限和正常蓄水位运行，兼顾供水、灌溉和发电。"),
-            result("prd93-gate-operation:1", "接到大降雨或台风暴雨预报时，可通过开闸、放水、泄洪、预泄降低库水位。"),
-            result("prd93-protection:1", "木瓜水库防洪保护对象包括下游行政村，需明确巡查责任人和联系方式。")
-    );
 
     private final HybridSearchService searchService;
 
@@ -67,9 +58,11 @@ public class SearchEvaluation {
     }
 
     public static void main(String[] args) {
-        SearchEvaluation evaluation = new SearchEvaluation();
-        EvaluationReport report = evaluation.evaluate(acceptanceCases(), REPORT_TOP_K, SearchEvaluation::fixtureRouteResults);
-        evaluation.printReport(report);
+        try (ConfigurableApplicationContext context = SpringApplication.run(SmartPaiApplication.class, args)) {
+            SearchEvaluation evaluation = new SearchEvaluation(context.getBean(HybridSearchService.class));
+            EvaluationReport report = evaluation.evaluateWithSearch(acceptanceCases(), REPORT_TOP_K);
+            evaluation.printReport(report);
+        }
     }
 
     static List<EvalCase> acceptanceCases() {
@@ -91,28 +84,35 @@ public class SearchEvaluation {
                               int topK,
                               Function<EvalCase, RouteResults> routeResultsProvider) {
         List<CaseReport> reports = cases.stream()
-                .map(evalCase -> evaluateCase(evalCase, topK, routeResultsProvider.apply(evalCase)))
+                .map(evalCase -> {
+                    RouteResults routeResults = routeResultsProvider.apply(evalCase);
+                    List<SearchResult> mergedResults = searchService.mergeByRrf(
+                            routeResults.bm25Results(),
+                            routeResults.vectorResults(),
+                            topK
+                    );
+                    return evaluateRankedResults(evalCase, mergedResults);
+                })
                 .toList();
 
-        return new EvaluationReport(
-                reports,
-                average(reports.stream().map(CaseReport::recallAt5).toList()),
-                average(reports.stream().map(CaseReport::recallAt10).toList()),
-                average(reports.stream().map(CaseReport::mrrAt10).toList())
-        );
+        return reportFrom(reports);
     }
 
-    private CaseReport evaluateCase(EvalCase evalCase, int topK, RouteResults routeResults) {
+    EvaluationReport evaluateWithSearch(List<EvalCase> cases, int topK) {
+        int resultK = Math.max(1, topK);
+        List<CaseReport> reports = cases.stream()
+                .map(evalCase -> evaluateRankedResults(evalCase, searchService.search(evalCase.query(), resultK)))
+                .toList();
+
+        return reportFrom(reports);
+    }
+
+    private CaseReport evaluateRankedResults(EvalCase evalCase, List<SearchResult> rankedResults) {
         String expandedQuery = searchService.expandQueryForRecall(evalCase.query());
-        List<SearchResult> mergedResults = searchService.mergeByRrf(
-                routeResults.bm25Results(),
-                routeResults.vectorResults(),
-                topK
-        );
-        List<String> mergedChunkKeys = mergedResults.stream()
+        List<String> mergedChunkKeys = rankedResults.stream()
                 .map(SearchEvaluation::chunkKey)
                 .toList();
-        List<String> matchedTextFragments = matchedTextFragments(mergedResults, evalCase.expectedTextFragments(), 10);
+        List<String> matchedTextFragments = matchedTextFragments(rankedResults, evalCase.expectedTextFragments(), 10);
         Set<String> hitsAt10 = hits(mergedChunkKeys, evalCase.expectedChunkKeys(), 10);
 
         return new CaseReport(
@@ -124,6 +124,15 @@ public class SearchEvaluation {
                 recallAtK(mergedChunkKeys, evalCase.expectedChunkKeys(), 5),
                 recallAtK(mergedChunkKeys, evalCase.expectedChunkKeys(), 10),
                 mrrAtK(mergedChunkKeys, evalCase.expectedChunkKeys(), 10)
+        );
+    }
+
+    private EvaluationReport reportFrom(List<CaseReport> reports) {
+        return new EvaluationReport(
+                reports,
+                average(reports.stream().map(CaseReport::recallAt5).toList()),
+                average(reports.stream().map(CaseReport::recallAt10).toList()),
+                average(reports.stream().map(CaseReport::mrrAt10).toList())
         );
     }
 
@@ -157,30 +166,6 @@ public class SearchEvaluation {
                 report.averageRecallAt10(),
                 report.averageMrrAt10()
         );
-    }
-
-    static RouteResults fixtureRouteResults(EvalCase evalCase) {
-        List<SearchResult> expected = PRD_ACCEPTANCE_FIXTURES.stream()
-                .filter(result -> evalCase.expectedChunkKeys().contains(chunkKey(result)))
-                .toList();
-        List<SearchResult> distractors = PRD_ACCEPTANCE_FIXTURES.stream()
-                .filter(result -> !evalCase.expectedChunkKeys().contains(chunkKey(result)))
-                .limit(2)
-                .toList();
-
-        List<SearchResult> bm25Results = new ArrayList<>(expected);
-        bm25Results.addAll(distractors);
-
-        List<SearchResult> vectorResults = reversedCopy(expected);
-        vectorResults.addAll(reversedCopy(distractors));
-
-        return new RouteResults(bm25Results, vectorResults);
-    }
-
-    private static List<SearchResult> reversedCopy(List<SearchResult> results) {
-        List<SearchResult> copy = new ArrayList<>(results);
-        Collections.reverse(copy);
-        return copy;
     }
 
     static double recallAtK(List<String> rankedChunkKeys, List<String> expectedChunkKeys, int k) {
@@ -233,19 +218,4 @@ public class SearchEvaluation {
         return result.getFileMd5() + ":" + result.getChunkId();
     }
 
-    private static SearchResult result(String chunkKey, String textContent) {
-        int separator = chunkKey.lastIndexOf(':');
-        if (separator < 1 || separator == chunkKey.length() - 1) {
-            throw new IllegalArgumentException("chunkKey must use fileMd5:chunkId format: " + chunkKey);
-        }
-        return result(
-                chunkKey.substring(0, separator),
-                Integer.parseInt(chunkKey.substring(separator + 1)),
-                textContent
-        );
-    }
-
-    private static SearchResult result(String fileMd5, int chunkId, String textContent) {
-        return new SearchResult(fileMd5, chunkId, textContent, 0.0d);
-    }
 }

@@ -215,10 +215,10 @@ public class HybridSearchService {
         return results;
     }
 
-    private List<SearchResult> searchBm25WithPermission(String recallQuery,
-                                                        String userDbId,
-                                                        List<String> userEffectiveTags,
-                                                        int recallK) throws Exception {
+    protected List<SearchResult> searchBm25WithPermission(String recallQuery,
+                                                          String userDbId,
+                                                          List<String> userEffectiveTags,
+                                                          int recallK) throws Exception {
         SearchResponse<EsDocument> response = esClient.search(
                 buildBm25SearchRequest(recallQuery, userDbId, userEffectiveTags, recallK),
                 EsDocument.class
@@ -227,10 +227,10 @@ public class HybridSearchService {
         return toSearchResults(response);
     }
 
-    private List<SearchResult> searchVectorWithPermission(List<Float> queryVector,
-                                                          String userDbId,
-                                                          List<String> userEffectiveTags,
-                                                          int recallK) throws Exception {
+    protected List<SearchResult> searchVectorWithPermission(List<Float> queryVector,
+                                                            String userDbId,
+                                                            List<String> userEffectiveTags,
+                                                            int recallK) throws Exception {
         SearchResponse<EsDocument> response = esClient.search(
                 buildVectorSearchRequest(queryVector, userDbId, userEffectiveTags, recallK),
                 EsDocument.class
@@ -548,7 +548,7 @@ public class HybridSearchService {
     /**
      * 生成查询向量，返回 List<Float>，失败时返回 null
      */
-    private List<Float> embedToVectorList(String text) {
+    protected List<Float> embedToVectorList(String text) {
         try {
             List<float[]> vecs = embeddingClient.embed(List.of(text));
             if (vecs == null || vecs.isEmpty()) {
@@ -628,7 +628,7 @@ public class HybridSearchService {
         }
     }
 
-    private void attachFileNames(List<SearchResult> results) {
+    protected void attachFileNames(List<SearchResult> results) {
         if (results == null || results.isEmpty()) {
             return;
         }

@@ -355,13 +355,13 @@ class HybridSearchServiceTest {
     }
 
     @Test
-    void prdAcceptanceEvaluationUsesRealExpectedFragments() {
-        SearchEvaluation evaluation = new SearchEvaluation(service);
+    void prdAcceptanceEvaluationRunsThroughHybridSearchRecallFlow() {
+        InMemoryRecallHybridSearchService recallService = new InMemoryRecallHybridSearchService();
+        SearchEvaluation evaluation = new SearchEvaluation(recallService);
 
-        SearchEvaluation.EvaluationReport report = evaluation.evaluate(
+        SearchEvaluation.EvaluationReport report = evaluation.evaluateWithSearch(
                 SearchEvaluation.acceptanceCases(),
-                10,
-                SearchEvaluation::fixtureRouteResults
+                10
         );
 
         assertThat(report.caseReports()).hasSize(10);
@@ -381,10 +381,129 @@ class HybridSearchServiceTest {
                 .singleElement()
                 .satisfies(caseReport -> assertThat(caseReport.matchedTextFragments())
                         .contains("开闸", "放水", "泄洪"));
+        assertThat(recallService.bm25RecallQueries())
+                .hasSize(10)
+                .anySatisfy(query -> assertThat(query).contains("307.00m", "310.00m"))
+                .anySatisfy(query -> assertThat(query).contains("开闸", "放水", "泄洪"));
+        assertThat(recallService.vectorRecallCount()).isEqualTo(10);
     }
 
     private SearchResult result(String fileMd5, int chunkId) {
         return new SearchResult(fileMd5, chunkId, "content-" + chunkId, 0.0d);
+    }
+
+    private static SearchResult result(String fileMd5, int chunkId, String textContent) {
+        return new SearchResult(fileMd5, chunkId, textContent, 0.0d, null, null, true);
+    }
+
+    private static class InMemoryRecallHybridSearchService extends HybridSearchService {
+
+        private final List<SearchResult> corpus = List.of(
+                result("prd93-principle", 1, "木瓜水库调度原则为防洪为主，兼顾发电、灌溉和兴利综合利用。"),
+                result("prd93-principle", 2, "运行原则包括总控制原则和分期控制原则，汛期按限制水位和预报雨情调度。"),
+                result("prd93-water-level", 1, "木瓜水库汛限水位按汛期分段控制，梅汛期限制水位为307.00m，台汛期限制水位为310.00m。"),
+                result("prd93-water-level", 2, "梅汛期水库限制水位为307.00m，超过控制水位时应及时预泄。"),
+                result("prd93-water-level", 3, "台汛期限制水位为310.00m，正常蓄水位314.00m，死水位298.00m。"),
+                result("prd93-operation", 1, "非汛期水库按兴利下限和正常蓄水位运行，兼顾供水、灌溉和发电。"),
+                result("prd93-gate-operation", 1, "接到大降雨或台风暴雨预报时，可通过开闸、放水、泄洪、预泄降低库水位。"),
+                result("prd93-protection", 1, "木瓜水库防洪保护对象包括下游行政村，需明确巡查责任人和联系方式。"),
+                result("distractor-geology", 1, "坝址地质条件、岩性和渗流监测记录用于工程安全复核。"),
+                result("distractor-weather", 1, "气象站记录包括风速、湿度和逐小时降雨量观测数据。"),
+                result("distractor-power", 1, "电站机组检修计划按年度维护窗口编制。"),
+                result("distractor-admin", 1, "档案归档要求包括目录、页码和移交签收记录。")
+        );
+        private final List<String> bm25RecallQueries = new ArrayList<>();
+        private int vectorRecallCount;
+        private volatile String embeddedQuery;
+
+        @Override
+        protected List<Float> embedToVectorList(String text) {
+            embeddedQuery = text;
+            return List.of(1.0f, 0.0f, 0.0f);
+        }
+
+        @Override
+        protected List<SearchResult> searchBm25WithPermission(String recallQuery,
+                                                              String userDbId,
+                                                              List<String> userEffectiveTags,
+                                                              int recallK) {
+            bm25RecallQueries.add(recallQuery);
+            List<String> terms = List.of(recallQuery.split("\\s+"));
+            return corpus.stream()
+                    .map(result -> new ScoredResult(result, lexicalScore(terms, result.getTextContent())))
+                    .filter(scored -> scored.score() > 0)
+                    .sorted(Comparator.comparingInt(ScoredResult::score).reversed())
+                    .limit(recallK)
+                    .map(scored -> scored.result())
+                    .toList();
+        }
+
+        @Override
+        protected List<SearchResult> searchVectorWithPermission(List<Float> queryVector,
+                                                                String userDbId,
+                                                                List<String> userEffectiveTags,
+                                                                int recallK) {
+            vectorRecallCount++;
+            return semanticCandidates(embeddedQuery).stream()
+                    .limit(recallK)
+                    .toList();
+        }
+
+        @Override
+        protected void attachFileNames(List<SearchResult> results) {
+            // The evaluation corpus is in-memory and does not require file metadata lookups.
+        }
+
+        private int lexicalScore(List<String> terms, String text) {
+            int score = 0;
+            for (String term : terms) {
+                if (!term.isBlank() && text.contains(term)) {
+                    score++;
+                }
+            }
+            return score;
+        }
+
+        private List<SearchResult> semanticCandidates(String query) {
+            if (query.contains("原则")) {
+                return byChunkKeys("prd93-principle:1", "prd93-principle:2", "prd93-water-level:1");
+            }
+            if (query.contains("汛限水位") || query.contains("限制水位") || query.contains("梅汛期") || query.contains("台汛期")) {
+                return byChunkKeys("prd93-water-level:1", "prd93-water-level:2", "prd93-water-level:3");
+            }
+            if (query.contains("非汛期")) {
+                return byChunkKeys("prd93-operation:1", "prd93-water-level:3", "prd93-principle:1");
+            }
+            if (query.contains("开闸") || query.contains("放水")) {
+                return byChunkKeys("prd93-gate-operation:1", "prd93-water-level:2", "prd93-water-level:1");
+            }
+            if (query.contains("为主") || query.contains("功能")) {
+                return byChunkKeys("prd93-principle:1", "prd93-operation:1", "prd93-principle:2");
+            }
+            if (query.contains("保护对象")) {
+                return byChunkKeys("prd93-protection:1", "prd93-principle:1", "distractor-admin:1");
+            }
+            return byChunkKeys("distractor-geology:1", "distractor-weather:1");
+        }
+
+        private List<SearchResult> byChunkKeys(String... chunkKeys) {
+            List<String> keys = List.of(chunkKeys);
+            return corpus.stream()
+                    .filter(result -> keys.contains(result.getFileMd5() + ":" + result.getChunkId()))
+                    .sorted(Comparator.comparingInt(result -> keys.indexOf(result.getFileMd5() + ":" + result.getChunkId())))
+                    .toList();
+        }
+
+        private List<String> bm25RecallQueries() {
+            return bm25RecallQueries;
+        }
+
+        private int vectorRecallCount() {
+            return vectorRecallCount;
+        }
+
+        private record ScoredResult(SearchResult result, int score) {
+        }
     }
 
     private void assertPermissionFilterContainsUserPublicAndOrgTags(Query permissionFilter) {

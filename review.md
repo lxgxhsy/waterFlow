@@ -1,16 +1,14 @@
-STATUS: CHANGES_REQUESTED
+STATUS: APPROVED
 ROUND: 2
-REVIEWED_SHA: fe96cf6ccd8b4ebeea8c84cd898dd54632a18ddd
+REVIEWED_SHA: 5c0ae4b4ed947c9dc3d44e57cd7b5397acf923ea
 
-## 任务清单
+## 复审结论
 
-- [ ] 新增一个 demo 单测，测试最新代码的核心行为
+ROUND 2 任务已完成。
 
-## 说明
+- [x] 新增 demo 单测 `demoHybridRecallFlowForReservoirScheduling`
 
-在 `HybridSearchServiceTest.java` 中补充一个端到端风格的 demo 测试，
-验证 `expandQueryForRecall` + `mergeByRrf` 协同工作的典型场景：
-给定一个水库调度类问题，扩展后的 query 应包含预期关键词，
-且 RRF 合并结果应按分数降序、去重正确。
-
-命名建议：`demoHybridRecallFlowForReservoirScheduling`
+测试覆盖了 expandQueryForRecall + mergeByRrf 的协同场景：
+- 台汛期调度问题同时触发原则类、水位类、操作类三组扩展词（验证多规则联合触发）
+- BM25 路含同 chunk 重复，向量路含跨文件命中，RRF 去重+累加+降序均正确
+- 结果截断到 topK=3，排序用 Comparator.reverseOrder() 断言严格降序

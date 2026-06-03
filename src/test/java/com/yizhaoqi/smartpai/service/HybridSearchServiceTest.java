@@ -3,6 +3,7 @@ package com.yizhaoqi.smartpai.service;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.junit.jupiter.api.Test;
 
+import java.util.Comparator;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -165,6 +166,41 @@ class HybridSearchServiceTest {
         assertThat(merged.get(0).getScore()).isGreaterThan(merged.get(1).getScore());
         assertThat(bm25B.getScore()).isEqualTo(0.0d);
         assertThat(vectorB.getScore()).isEqualTo(0.0d);
+    }
+
+    @Test
+    void demoHybridRecallFlowForReservoirScheduling() {
+        String expanded = service.expandQueryForRecall("台汛期水库如何调度并控制水位？");
+
+        assertThat(expanded)
+                .contains("台汛期水库如何调度并控制水位？")
+                .contains("调度原则")
+                .contains("运行原则")
+                .contains("汛限水位")
+                .contains("控制水位")
+                .contains("台汛期")
+                .contains("防洪为主");
+
+        SearchResult bm25WaterLevel = result("reservoir-plan", 1);
+        SearchResult bm25GateOperation = result("reservoir-plan", 2);
+        SearchResult bm25Duplicate = result("reservoir-plan", 1);
+        SearchResult vectorGateOperation = result("reservoir-plan", 2);
+        SearchResult vectorForecast = result("flood-control", 3);
+        SearchResult vectorWaterLevel = result("reservoir-plan", 1);
+
+        List<SearchResult> merged = service.mergeByRrf(
+                List.of(bm25WaterLevel, bm25GateOperation, bm25Duplicate),
+                List.of(vectorGateOperation, vectorForecast, vectorWaterLevel),
+                3
+        );
+
+        assertThat(merged)
+                .hasSize(3)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("reservoir-plan:2", "reservoir-plan:1", "flood-control:3");
+        assertThat(merged)
+                .extracting(SearchResult::getScore)
+                .isSortedAccordingTo(Comparator.reverseOrder());
     }
 
     @Test

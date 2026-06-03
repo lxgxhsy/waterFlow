@@ -1,6 +1,7 @@
 package com.yizhaoqi.smartpai.service;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
@@ -28,6 +29,7 @@ import java.util.Map;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
@@ -128,6 +130,7 @@ public class HybridSearchService {
             List<SearchResult> rrfCandidates = mergeByRrf(bm25Results, vectorResults, rerankerCandidateLimit(resultK));
             List<SearchResult> results = applyReranker(query, rrfCandidates, resultK);
             logger.debug("返回搜索结果数量: {}", results.size());
+            expandResultContexts(results, userDbId, userEffectiveTags);
             attachFileNames(results);
             return results;
         } catch (Exception e) {
@@ -157,6 +160,7 @@ public class HybridSearchService {
                     resultK
             );
             logger.debug("返回纯文本搜索结果数量: {}", results.size());
+            expandResultContexts(results, userDbId, userEffectiveTags);
             attachFileNames(results);
             return results;
         } catch (Exception e) {
@@ -197,6 +201,7 @@ public class HybridSearchService {
 
             List<SearchResult> rrfCandidates = mergeByRrf(bm25Results, vectorResults, rerankerCandidateLimit(resultK));
             List<SearchResult> results = applyReranker(query, rrfCandidates, resultK);
+            expandResultContexts(results, null, Collections.emptyList());
             attachFileNames(results);
             return results;
         } catch (Exception e) {
@@ -222,6 +227,7 @@ public class HybridSearchService {
                 searchBm25WithPermission(recallQuery, null, Collections.emptyList(), bm25RecallK(resultK)),
                 resultK
         );
+        expandResultContexts(results, null, Collections.emptyList());
         attachFileNames(results);
         return results;
     }
@@ -285,6 +291,43 @@ public class HybridSearchService {
                         .filter(permissionQuery)
                 )
                 .size(recallK)
+        );
+    }
+
+    SearchRequest buildContextExpansionSearchRequest(SearchResult hit,
+                                                     String userDbId,
+                                                     List<String> userEffectiveTags) {
+        Query permissionQuery = buildPermissionQuery(userDbId, userEffectiveTags);
+        int beforeWindow = contextBeforeWindow();
+        int afterWindow = contextAfterWindow();
+        int fromChunk = Math.max(0, hit.getChunkId() - beforeWindow);
+        int toChunk = Math.max(hit.getChunkId(), hit.getChunkId() + afterWindow);
+        Set<Integer> exactChunkIds = new LinkedHashSet<>();
+        if (hit.getParentChunkId() != null) {
+            exactChunkIds.add(hit.getParentChunkId());
+        }
+
+        return SearchRequest.of(s -> s
+                .index("knowledge_base")
+                .query(q -> q.bool(b -> {
+                    b.filter(f -> f.term(t -> t.field("fileMd5").value(hit.getFileMd5())));
+                    b.filter(permissionQuery);
+                    b.must(m -> m.bool(match -> {
+                        match.should(sh -> sh.range(r -> r
+                                .field("chunkId")
+                                .gte(co.elastic.clients.json.JsonData.of(fromChunk))
+                                .lte(co.elastic.clients.json.JsonData.of(toChunk))
+                        ));
+                        exactChunkIds.forEach(chunkId ->
+                                match.should(sh -> sh.term(t -> t.field("chunkId").value(chunkId)))
+                        );
+                        match.minimumShouldMatch("1");
+                        return match;
+                    }));
+                    return b;
+                }))
+                .sort(sort -> sort.field(f -> f.field("chunkId").order(SortOrder.Asc)))
+                .size(beforeWindow + afterWindow + exactChunkIds.size() + 1)
         );
     }
 
@@ -404,7 +447,7 @@ public class HybridSearchService {
     }
 
     private SearchResult copyWithScore(SearchResult source, double score) {
-        return new SearchResult(
+        SearchResult copy = new SearchResult(
                 source.getFileMd5(),
                 source.getChunkId(),
                 source.getTextContent(),
@@ -414,6 +457,11 @@ public class HybridSearchService {
                 Boolean.TRUE.equals(source.getIsPublic()),
                 source.getFileName()
         );
+        copy.setSectionTitle(source.getSectionTitle());
+        copy.setPageNumber(source.getPageNumber());
+        copy.setClauseNumber(source.getClauseNumber());
+        copy.setParentChunkId(source.getParentChunkId());
+        return copy;
     }
 
     private List<SearchResult> toSearchResults(SearchResponse<EsDocument> response) {
@@ -430,7 +478,7 @@ public class HybridSearchService {
                 source.getChunkId(),
                 hit.score(),
                 source.getTextContent() == null ? "" : source.getTextContent().substring(0, Math.min(50, source.getTextContent().length())));
-        return new SearchResult(
+        SearchResult result = new SearchResult(
                 source.getFileMd5(),
                 source.getChunkId(),
                 source.getTextContent(),
@@ -439,6 +487,11 @@ public class HybridSearchService {
                 source.getOrgTag(),
                 source.isPublic()
         );
+        result.setSectionTitle(source.getSectionTitle());
+        result.setPageNumber(source.getPageNumber());
+        result.setClauseNumber(source.getClauseNumber());
+        result.setParentChunkId(source.getParentChunkId());
+        return result;
     }
 
     private List<SearchResult> limitResults(List<SearchResult> results, int topK) {
@@ -460,6 +513,20 @@ public class HybridSearchService {
 
     private boolean rerankerEnabled() {
         return Boolean.TRUE.equals(aiProperties.getReranker().getEnabled());
+    }
+
+    private boolean contextExpansionEnabled() {
+        return Boolean.TRUE.equals(aiProperties.getContextExpansion().getEnabled());
+    }
+
+    private int contextBeforeWindow() {
+        Integer value = aiProperties.getContextExpansion().getBeforeWindow();
+        return value == null ? 0 : Math.max(0, value);
+    }
+
+    private int contextAfterWindow() {
+        Integer value = aiProperties.getContextExpansion().getAfterWindow();
+        return value == null ? 0 : Math.max(0, value);
     }
 
     private int rerankerCandidateLimit(int topK) {
@@ -680,14 +747,105 @@ public class HybridSearchService {
             // 收集所有唯一的 fileMd5
             Set<String> md5Set = results.stream()
                     .map(SearchResult::getFileMd5)
-                    .collect(Collectors.toSet());
+                    .filter(fileMd5 -> fileMd5 != null && !fileMd5.isBlank())
+                    .collect(Collectors.toCollection(HashSet::new));
+            results.stream()
+                    .flatMap(result -> result.getContextChunks().stream())
+                    .map(SearchResult.ContextChunk::getFileMd5)
+                    .filter(fileMd5 -> fileMd5 != null && !fileMd5.isBlank())
+                    .forEach(md5Set::add);
+            if (md5Set.isEmpty()) {
+                return;
+            }
             List<FileUpload> uploads = fileUploadRepository.findByFileMd5In(new java.util.ArrayList<>(md5Set));
             Map<String, String> md5ToName = uploads.stream()
                     .collect(Collectors.toMap(FileUpload::getFileMd5, FileUpload::getFileName));
             // 填充文件名
-            results.forEach(r -> r.setFileName(md5ToName.get(r.getFileMd5())));
+            results.forEach(r -> {
+                r.setFileName(md5ToName.get(r.getFileMd5()));
+                r.getContextChunks().forEach(contextChunk ->
+                        contextChunk.setFileName(md5ToName.get(contextChunk.getFileMd5()))
+                );
+            });
         } catch (Exception e) {
             logger.error("补充文件名失败", e);
         }
+    }
+
+    void expandResultContexts(List<SearchResult> results, String userDbId, List<String> userEffectiveTags) {
+        if (!contextExpansionEnabled() || results == null || results.isEmpty()) {
+            return;
+        }
+
+        for (SearchResult result : results) {
+            if (result == null || result.getFileMd5() == null || result.getChunkId() == null) {
+                continue;
+            }
+            try {
+                List<SearchResult> contextResults = searchContextChunksWithPermission(result, userDbId, userEffectiveTags);
+                result.setContextChunks(toContextChunks(result, contextResults));
+            } catch (Exception e) {
+                logger.warn("上下文扩展失败，保留原始命中 chunk: fileMd5={}, chunkId={}",
+                        result.getFileMd5(), result.getChunkId(), e);
+            }
+        }
+    }
+
+    protected List<SearchResult> searchContextChunksWithPermission(SearchResult hit,
+                                                                   String userDbId,
+                                                                   List<String> userEffectiveTags) throws Exception {
+        SearchResponse<EsDocument> response = esClient.search(
+                buildContextExpansionSearchRequest(hit, userDbId, userEffectiveTags),
+                EsDocument.class
+        );
+        return toSearchResults(response);
+    }
+
+    private List<SearchResult.ContextChunk> toContextChunks(SearchResult hit, List<SearchResult> contextResults) {
+        Map<String, SearchResult> unique = new LinkedHashMap<>();
+        safeResults(contextResults).forEach(contextResult -> {
+            String key = resultKey(contextResult);
+            if (key != null) {
+                unique.putIfAbsent(key, contextResult);
+            }
+        });
+        unique.putIfAbsent(resultKey(hit), hit);
+
+        return unique.values().stream()
+                .sorted(Comparator
+                        .comparing((SearchResult result) -> !sameChunk(result, hit))
+                        .thenComparing(SearchResult::getFileMd5, Comparator.nullsLast(String::compareTo))
+                .thenComparing(SearchResult::getChunkId, Comparator.nullsLast(Integer::compareTo)))
+                .map(result -> new SearchResult.ContextChunk(
+                        result.getFileMd5(),
+                        result.getChunkId(),
+                        result.getTextContent(),
+                        result.getFileName() != null ? result.getFileName() : hit.getFileName(),
+                        result.getSectionTitle(),
+                        result.getPageNumber(),
+                        result.getClauseNumber(),
+                        result.getParentChunkId(),
+                        contextRelation(hit, result)
+                ))
+                .toList();
+    }
+
+    private boolean sameChunk(SearchResult left, SearchResult right) {
+        return left != null
+                && right != null
+                && left.getFileMd5() != null
+                && left.getFileMd5().equals(right.getFileMd5())
+                && left.getChunkId() != null
+                && left.getChunkId().equals(right.getChunkId());
+    }
+
+    private String contextRelation(SearchResult hit, SearchResult context) {
+        if (sameChunk(hit, context)) {
+            return "hit";
+        }
+        if (hit.getParentChunkId() != null && hit.getParentChunkId().equals(context.getChunkId())) {
+            return "parent";
+        }
+        return "adjacent";
     }
 }

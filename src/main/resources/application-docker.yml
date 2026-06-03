@@ -117,6 +117,10 @@ ai:
   reranker:
     enabled: false
     candidate-limit: 50
+  context-expansion:
+    enabled: true
+    before-window: 1
+    after-window: 1
   prompt:
     rules: |
         你是一个水利领域专家，须遵守：

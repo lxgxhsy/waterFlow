@@ -550,6 +550,90 @@ class HybridSearchServiceTest {
         assertThat(recallService.vectorRecallCount()).isEqualTo(10);
     }
 
+    @Test
+    void expandsHitChunkWithAdjacentAndParentChunksForAnswerContext() {
+        HybridSearchService expansionService = new InMemoryContextExpansionHybridSearchService(List.of(
+                richResult("manual", 1, "前一块", "42", null, false, null),
+                richResult("manual", 2, "命中块", "42", null, false, 10),
+                richResult("manual", 3, "后一块", "42", null, false, null),
+                richResult("manual", 10, "父块标题", "42", null, false, null)
+        ));
+        SearchResult hit = richResult("manual", 2, "命中块", "42", null, false, 10);
+        hit.setFileName("调度规程.pdf");
+
+        expansionService.expandResultContexts(List.of(hit), "42", List.of());
+
+        assertThat(hit.getContextChunks())
+                .extracting(SearchResult.ContextChunk::getChunkId)
+                .containsExactly(2, 1, 3, 10);
+        assertThat(hit.getContextChunks())
+                .extracting(SearchResult.ContextChunk::getRelation)
+                .containsExactly("hit", "adjacent", "adjacent", "parent");
+        assertThat(hit.getContextChunks().get(0).getFileName()).isEqualTo("调度规程.pdf");
+    }
+
+    @Test
+    void contextExpansionDoesNotBypassPermissionFiltering() {
+        HybridSearchService expansionService = new InMemoryContextExpansionHybridSearchService(List.of(
+                richResult("manual", 1, "其他用户前一块", "99", null, false, null),
+                richResult("manual", 2, "命中块", "42", null, false, null),
+                richResult("manual", 3, "同用户后一块", "42", null, false, null),
+                richResult("manual", 4, "公开块", null, null, true, null),
+                richResult("manual", 5, "同组织块", "88", "OPS", false, null)
+        ));
+        SearchResult hit = richResult("manual", 2, "命中块", "42", null, false, null);
+
+        expansionService.expandResultContexts(List.of(hit), "42", List.of("OPS"));
+
+        assertThat(hit.getContextChunks())
+                .extracting(SearchResult.ContextChunk::getChunkId)
+                .containsExactly(2, 3);
+        assertThat(hit.getContextChunks())
+                .extracting(SearchResult.ContextChunk::getTextContent)
+                .doesNotContain("其他用户前一块");
+    }
+
+    @Test
+    void contextExpansionDoesNotChangeTopKOrderingOrScores() {
+        InMemoryContextExpansionHybridSearchService searchService = new InMemoryContextExpansionHybridSearchService(List.of(
+                result("file-a", 1, "file-a before"),
+                result("file-a", 2, "file-a hit"),
+                result("file-b", 1, "file-b hit"),
+                result("file-b", 2, "file-b after")
+        ));
+        searchService.setRecallResults(
+                List.of(result("file-a", 2, "file-a hit"), result("file-b", 1, "file-b hit")),
+                List.of()
+        );
+
+        List<SearchResult> results = searchService.search("query", 2);
+
+        assertThat(results)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-a:2", "file-b:1");
+        assertThat(results)
+                .extracting(SearchResult::getScore)
+                .containsExactly(0.8d / (60 + 1), 0.8d / (60 + 2));
+        assertThat(results)
+                .allSatisfy(result -> assertThat(result.getContextChunks()).isNotEmpty());
+    }
+
+    @Test
+    void disabledContextExpansionLeavesResultsAsCurrentBehavior() {
+        InMemoryContextExpansionHybridSearchService expansionService = new InMemoryContextExpansionHybridSearchService(List.of(
+                result("manual", 1, "前一块"),
+                result("manual", 2, "命中块"),
+                result("manual", 3, "后一块")
+        ));
+        expansionService.setAiProperties(contextExpansionProperties(false, 1, 1));
+        SearchResult hit = result("manual", 2, "命中块");
+
+        expansionService.expandResultContexts(List.of(hit), null, List.of());
+
+        assertThat(hit.getContextChunks()).isEmpty();
+        assertThat(expansionService.contextLookupCount()).isZero();
+    }
+
     private SearchResult result(String fileMd5, int chunkId) {
         return new SearchResult(fileMd5, chunkId, "content-" + chunkId, 0.0d);
     }
@@ -558,11 +642,35 @@ class HybridSearchServiceTest {
         AiProperties properties = new AiProperties();
         properties.getReranker().setEnabled(enabled);
         properties.getReranker().setCandidateLimit(candidateLimit);
+        properties.getContextExpansion().setEnabled(false);
+        return properties;
+    }
+
+    private static AiProperties contextExpansionProperties(boolean enabled, int beforeWindow, int afterWindow) {
+        AiProperties properties = new AiProperties();
+        properties.getContextExpansion().setEnabled(enabled);
+        properties.getContextExpansion().setBeforeWindow(beforeWindow);
+        properties.getContextExpansion().setAfterWindow(afterWindow);
         return properties;
     }
 
     private static SearchResult result(String fileMd5, int chunkId, String textContent) {
         return new SearchResult(fileMd5, chunkId, textContent, 0.0d, null, null, true);
+    }
+
+    private static SearchResult richResult(String fileMd5,
+                                           int chunkId,
+                                           String textContent,
+                                           String userId,
+                                           String orgTag,
+                                           boolean isPublic,
+                                           Integer parentChunkId) {
+        SearchResult result = new SearchResult(fileMd5, chunkId, textContent, 0.0d, userId, orgTag, isPublic);
+        result.setParentChunkId(parentChunkId);
+        result.setSectionTitle("第" + chunkId + "节");
+        result.setPageNumber(chunkId);
+        result.setClauseNumber("T-" + chunkId);
+        return result;
     }
 
     private static class InMemoryRecallHybridSearchService extends HybridSearchService {
@@ -584,6 +692,10 @@ class HybridSearchServiceTest {
         private final List<String> bm25RecallQueries = new ArrayList<>();
         private int vectorRecallCount;
         private volatile String embeddedQuery;
+
+        private InMemoryRecallHybridSearchService() {
+            setAiProperties(contextExpansionProperties(false, 1, 1));
+        }
 
         @Override
         protected List<Float> embedToVectorList(String text) {
@@ -686,6 +798,7 @@ class HybridSearchServiceTest {
                 results.add(result("file-" + i, i, "content-" + i));
             }
             this.corpus = results;
+            setAiProperties(contextExpansionProperties(false, 1, 1));
         }
 
         @Override
@@ -716,6 +829,84 @@ class HybridSearchServiceTest {
         @Override
         protected void attachFileNames(List<SearchResult> results) {
             // In-memory test data has no file metadata.
+        }
+    }
+
+    private static class InMemoryContextExpansionHybridSearchService extends HybridSearchService {
+
+        private final List<SearchResult> corpus;
+        private List<SearchResult> bm25Results = List.of();
+        private List<SearchResult> vectorResults = List.of();
+        private int contextLookupCount;
+
+        private InMemoryContextExpansionHybridSearchService(List<SearchResult> corpus) {
+            this.corpus = corpus;
+            setAiProperties(contextExpansionProperties(true, 1, 1));
+        }
+
+        private void setRecallResults(List<SearchResult> bm25Results, List<SearchResult> vectorResults) {
+            this.bm25Results = bm25Results;
+            this.vectorResults = vectorResults;
+        }
+
+        private int contextLookupCount() {
+            return contextLookupCount;
+        }
+
+        @Override
+        protected List<Float> embedToVectorList(String text) {
+            return List.of(1.0f, 0.0f, 0.0f);
+        }
+
+        @Override
+        protected List<SearchResult> searchBm25WithPermission(String recallQuery,
+                                                              String userDbId,
+                                                              List<String> userEffectiveTags,
+                                                              int recallK) {
+            return bm25Results.stream().limit(recallK).toList();
+        }
+
+        @Override
+        protected List<SearchResult> searchVectorWithPermission(List<Float> queryVector,
+                                                                String userDbId,
+                                                                List<String> userEffectiveTags,
+                                                                int recallK) {
+            return vectorResults.stream().limit(recallK).toList();
+        }
+
+        @Override
+        protected List<SearchResult> searchContextChunksWithPermission(SearchResult hit,
+                                                                       String userDbId,
+                                                                       List<String> userEffectiveTags) {
+            contextLookupCount++;
+            return corpus.stream()
+                    .filter(candidate -> candidate.getFileMd5().equals(hit.getFileMd5()))
+                    .filter(candidate -> permitted(candidate, userDbId, userEffectiveTags))
+                    .filter(candidate -> isContextCandidate(hit, candidate))
+                    .toList();
+        }
+
+        @Override
+        protected void attachFileNames(List<SearchResult> results) {
+            // In-memory test data has no file metadata repository.
+        }
+
+        private boolean permitted(SearchResult candidate, String userDbId, List<String> userEffectiveTags) {
+            if (userDbId == null && (userEffectiveTags == null || userEffectiveTags.isEmpty())) {
+                return Boolean.TRUE.equals(candidate.getIsPublic());
+            }
+            return Boolean.TRUE.equals(candidate.getIsPublic())
+                    || userDbId != null && userDbId.equals(candidate.getUserId())
+                    || candidate.getOrgTag() != null
+                    && userEffectiveTags != null
+                    && userEffectiveTags.contains(candidate.getOrgTag());
+        }
+
+        private boolean isContextCandidate(SearchResult hit, SearchResult candidate) {
+            int chunkId = candidate.getChunkId();
+            int hitChunkId = hit.getChunkId();
+            return Math.abs(chunkId - hitChunkId) <= 1
+                    || hit.getParentChunkId() != null && hit.getParentChunkId().equals(chunkId);
         }
     }
 

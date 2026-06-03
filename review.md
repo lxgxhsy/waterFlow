@@ -1,10 +1,11 @@
-STATUS: APPROVED
-ROUND: 6
+STATUS: CHANGES_REQUESTED
+ROUND: 7
 REVIEWED_SHA: 1e2daaa553c6c66db9166aee854827d9d9487256
 
 ## 本轮任务
-- [x] 修复匿名搜索权限：`HybridSearchService.search(query, topK)` 现在通过 `isPublic=true` 权限过滤限制匿名/兼容搜索范围。
-- [x] 补充权限过滤测试：已验证 BM25 召回和向量召回请求都携带 `userId/isPublic/orgTag` 权限 filter，并覆盖匿名 public-only filter。
-- [x] 将评测框架从固定 fixture 推进到可验证检索链路：`SearchEvaluation.evaluateWithSearch` 现在调用 `HybridSearchService.search`，测试通过 in-memory recall service 覆盖 BM25 query expansion、vector recall 和 RRF 后的 PRD 验收片段命中。
-- [x] 补充性能验证或优化说明：双路召回已改为 `CompletableFuture` 并行执行，消除了本轮串行召回缺口。
-- [x] 明确 reranker 预留点：已新增 `SearchReranker` 扩展接口，并在 RRF merge 后通过 `applyReranker` 接入。
+- [ ] 实现 PRD Phase 3 reranker 精排链路：RRF 后保留可配置候选窗口（默认 top 50），再由 reranker 精排输出最终 topK，不能继续只把 topK 直接送入 reranker。
+- [ ] 增加 reranker 配置开关：默认关闭，不依赖外部 reranker 服务；开启后才调用 reranker，并支持候选数量配置。
+- [ ] 输出 reranker score：reranker 返回结果时应把最终精排分写入 `SearchResult.score`，关闭或失败时保留 RRF score。
+- [ ] 增加降级保护：reranker 返回 null、抛异常或未配置实现时，应回退到 RRF 排序，不影响检索接口可用性。
+- [ ] 补充单元测试：覆盖关闭时不调用 reranker、开启时 reranker 接收 top50 候选并最终截断 topK、reranker score 生效、reranker 失败回退 RRF。
+- [ ] 验证命令：至少通过 `mvn test -Dtest=HybridSearchServiceTest`。

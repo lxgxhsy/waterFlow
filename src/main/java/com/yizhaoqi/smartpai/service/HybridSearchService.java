@@ -1,6 +1,7 @@
 package com.yizhaoqi.smartpai.service;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
@@ -26,6 +27,8 @@ import java.util.Map;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
 
 /**
@@ -61,6 +64,15 @@ public class HybridSearchService {
     @Autowired
     private FileUploadRepository fileUploadRepository;
 
+    private SearchReranker searchReranker = SearchReranker.identity();
+
+    @Autowired(required = false)
+    void setSearchReranker(SearchReranker searchReranker) {
+        if (searchReranker != null) {
+            this.searchReranker = searchReranker;
+        }
+    }
+
     /**
      * 使用文本匹配和向量相似度进行混合搜索，支持权限过滤
      * 该方法确保用户只能搜索其有权限访问的文档（自己的文档、公开文档、所属组织的文档）
@@ -94,13 +106,17 @@ public class HybridSearchService {
                 return textOnlySearchWithPermission(query, userDbId, userEffectiveTags, resultK);
             }
 
-            List<SearchResult> bm25Results = searchBm25WithPermission(recallQuery, userDbId, userEffectiveTags, bm25RecallK);
-            logger.debug("BM25 召回完成，候选数量: {}", bm25Results.size());
+            CompletableFuture<List<SearchResult>> bm25Future = recallAsync(
+                    () -> searchBm25WithPermission(recallQuery, userDbId, userEffectiveTags, bm25RecallK)
+            );
+            CompletableFuture<List<SearchResult>> vectorFuture = recallAsync(
+                    () -> searchVectorWithPermission(queryVector, userDbId, userEffectiveTags, vectorRecallK)
+            );
+            List<SearchResult> bm25Results = bm25Future.join();
+            List<SearchResult> vectorResults = vectorFuture.join();
+            logger.debug("双路并行召回完成，BM25 候选数量: {}, 向量候选数量: {}", bm25Results.size(), vectorResults.size());
 
-            List<SearchResult> vectorResults = searchVectorWithPermission(queryVector, userDbId, userEffectiveTags, vectorRecallK);
-            logger.debug("向量召回完成，候选数量: {}", vectorResults.size());
-
-            List<SearchResult> results = mergeByRrf(bm25Results, vectorResults, resultK);
+            List<SearchResult> results = applyReranker(query, mergeByRrf(bm25Results, vectorResults, resultK), resultK);
             logger.debug("返回搜索结果数量: {}", results.size());
             attachFileNames(results);
             return results;
@@ -140,12 +156,12 @@ public class HybridSearchService {
     }
 
     /**
-     * 原始搜索方法，不包含权限过滤，保留向后兼容性
+     * 匿名/兼容搜索方法，仅返回公开文档。
      */
     public List<SearchResult> search(String query, int topK) {
         try {
             logger.debug("开始混合检索，查询: {}, topK: {}", query, topK);
-            logger.warn("使用了没有权限过滤的搜索方法，建议使用 searchWithPermission 方法");
+            logger.debug("未提供用户身份，搜索范围限制为公开文档");
 
             final String recallQuery = expandQueryForRecall(query);
             logger.debug("检索召回查询: {}", recallQuery);
@@ -159,13 +175,17 @@ public class HybridSearchService {
                 return textOnlySearch(query, resultK);
             }
 
-            List<SearchResult> bm25Results = searchBm25WithPermission(recallQuery, null, Collections.emptyList(), bm25RecallK);
-            logger.debug("BM25 召回完成，候选数量: {}", bm25Results.size());
+            CompletableFuture<List<SearchResult>> bm25Future = recallAsync(
+                    () -> searchBm25WithPermission(recallQuery, null, Collections.emptyList(), bm25RecallK)
+            );
+            CompletableFuture<List<SearchResult>> vectorFuture = recallAsync(
+                    () -> searchVectorWithPermission(queryVector, null, Collections.emptyList(), vectorRecallK)
+            );
+            List<SearchResult> bm25Results = bm25Future.join();
+            List<SearchResult> vectorResults = vectorFuture.join();
+            logger.debug("双路并行召回完成，BM25 候选数量: {}, 向量候选数量: {}", bm25Results.size(), vectorResults.size());
 
-            List<SearchResult> vectorResults = searchVectorWithPermission(queryVector, null, Collections.emptyList(), vectorRecallK);
-            logger.debug("向量召回完成，候选数量: {}", vectorResults.size());
-
-            List<SearchResult> results = mergeByRrf(bm25Results, vectorResults, resultK);
+            List<SearchResult> results = applyReranker(query, mergeByRrf(bm25Results, vectorResults, resultK), resultK);
             attachFileNames(results);
             return results;
         } catch (Exception e) {
@@ -199,19 +219,8 @@ public class HybridSearchService {
                                                         String userDbId,
                                                         List<String> userEffectiveTags,
                                                         int recallK) throws Exception {
-        Query permissionQuery = buildPermissionQuery(userDbId, userEffectiveTags);
-        SearchResponse<EsDocument> response = esClient.search(s -> s
-                .index("knowledge_base")
-                .query(q -> q
-                        .bool(b -> b
-                                .must(m -> m.match(ma -> ma
-                                        .field("textContent")
-                                        .query(recallQuery)
-                                ))
-                                .filter(permissionQuery)
-                        )
-                )
-                .size(recallK),
+        SearchResponse<EsDocument> response = esClient.search(
+                buildBm25SearchRequest(recallQuery, userDbId, userEffectiveTags, recallK),
                 EsDocument.class
         );
 
@@ -222,8 +231,40 @@ public class HybridSearchService {
                                                           String userDbId,
                                                           List<String> userEffectiveTags,
                                                           int recallK) throws Exception {
+        SearchResponse<EsDocument> response = esClient.search(
+                buildVectorSearchRequest(queryVector, userDbId, userEffectiveTags, recallK),
+                EsDocument.class
+        );
+
+        return toSearchResults(response);
+    }
+
+    SearchRequest buildBm25SearchRequest(String recallQuery,
+                                         String userDbId,
+                                         List<String> userEffectiveTags,
+                                         int recallK) {
         Query permissionQuery = buildPermissionQuery(userDbId, userEffectiveTags);
-        SearchResponse<EsDocument> response = esClient.search(s -> s
+        return SearchRequest.of(s -> s
+                .index("knowledge_base")
+                .query(q -> q
+                        .bool(b -> b
+                                .must(m -> m.match(ma -> ma
+                                        .field("textContent")
+                                        .query(recallQuery)
+                                ))
+                                .filter(permissionQuery)
+                        )
+                )
+                .size(recallK)
+        );
+    }
+
+    SearchRequest buildVectorSearchRequest(List<Float> queryVector,
+                                           String userDbId,
+                                           List<String> userEffectiveTags,
+                                           int recallK) {
+        Query permissionQuery = buildPermissionQuery(userDbId, userEffectiveTags);
+        return SearchRequest.of(s -> s
                 .index("knowledge_base")
                 .knn(kn -> kn
                         .field("vector")
@@ -232,18 +273,15 @@ public class HybridSearchService {
                         .numCandidates(vectorNumCandidatesK(recallK))
                         .filter(permissionQuery)
                 )
-                .size(recallK),
-                EsDocument.class
+                .size(recallK)
         );
-
-        return toSearchResults(response);
     }
 
-    private Query buildPermissionQuery(String userDbId, List<String> userEffectiveTags) {
+    Query buildPermissionQuery(String userDbId, List<String> userEffectiveTags) {
         boolean hasUser = userDbId != null && !userDbId.isBlank();
         boolean hasTags = userEffectiveTags != null && !userEffectiveTags.isEmpty();
         if (!hasUser && !hasTags) {
-            return Query.of(q -> q.matchAll(m -> m));
+            return Query.of(q -> q.term(t -> t.field("isPublic").value(true)));
         }
 
         return Query.of(q -> q.bool(b -> {
@@ -269,6 +307,29 @@ public class HybridSearchService {
             b.minimumShouldMatch("1");
             return b;
         }));
+    }
+
+    private CompletableFuture<List<SearchResult>> recallAsync(SearchSupplier supplier) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return supplier.get();
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        });
+    }
+
+    List<SearchResult> applyReranker(String query, List<SearchResult> mergedResults, int topK) {
+        List<SearchResult> reranked = searchReranker.rerank(query, mergedResults, normalizeTopK(topK));
+        if (reranked == null) {
+            return mergedResults;
+        }
+        return limitResults(reranked, topK);
+    }
+
+    @FunctionalInterface
+    private interface SearchSupplier {
+        List<SearchResult> get() throws Exception;
     }
 
     List<SearchResult> mergeByRrf(List<SearchResult> bm25Results, List<SearchResult> vectorResults, int topK) {

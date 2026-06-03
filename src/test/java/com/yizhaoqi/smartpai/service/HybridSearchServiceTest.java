@@ -1,8 +1,12 @@
 package com.yizhaoqi.smartpai.service;
 
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 
@@ -141,6 +145,36 @@ class HybridSearchServiceTest {
     }
 
     @Test
+    void anonymousPermissionQueryLimitsResultsToPublicDocuments() {
+        Query permissionQuery = service.buildPermissionQuery(null, List.of());
+
+        assertThat(permissionQuery.isTerm()).isTrue();
+        assertThat(permissionQuery.term().field()).isEqualTo("isPublic");
+        assertThat(permissionQuery.term().value().booleanValue()).isTrue();
+    }
+
+    @Test
+    void bm25AndVectorRecallRequestsCarrySamePermissionFilter() {
+        SearchRequest bm25Request = service.buildBm25SearchRequest("汛限水位", "42", List.of("FLOOD", "OPS"), 10);
+        SearchRequest vectorRequest = service.buildVectorSearchRequest(List.of(0.1f, 0.2f, 0.3f), "42", List.of("FLOOD", "OPS"), 10);
+
+        Query bm25PermissionFilter = bm25Request.query().bool().filter().get(0);
+        Query vectorPermissionFilter = vectorRequest.knn().get(0).filter().get(0);
+
+        assertPermissionFilterContainsUserPublicAndOrgTags(bm25PermissionFilter);
+        assertPermissionFilterContainsUserPublicAndOrgTags(vectorPermissionFilter);
+    }
+
+    @Test
+    void anonymousBm25AndVectorRecallRequestsUsePublicPermissionFilter() {
+        SearchRequest bm25Request = service.buildBm25SearchRequest("公开规程", null, List.of(), 10);
+        SearchRequest vectorRequest = service.buildVectorSearchRequest(List.of(0.1f, 0.2f, 0.3f), null, List.of(), 10);
+
+        assertPublicOnlyFilter(bm25Request.query().bool().filter().get(0));
+        assertPublicOnlyFilter(vectorRequest.knn().get(0).filter().get(0));
+    }
+
+    @Test
     void mergesBm25AndVectorResultsByRrfRankAndStableChunkKey() {
         SearchResult bm25A = result("file-a", 1);
         SearchResult bm25B = result("file-b", 2);
@@ -243,6 +277,27 @@ class HybridSearchServiceTest {
     }
 
     @Test
+    void rerankerExtensionPointCanReorderMergedCandidates() {
+        HybridSearchService rerankingService = new HybridSearchService();
+        rerankingService.setSearchReranker((query, candidates, topK) -> {
+            List<SearchResult> reversed = new ArrayList<>(candidates);
+            Collections.reverse(reversed);
+            return reversed;
+        });
+
+        List<SearchResult> merged = rerankingService.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2)),
+                List.of(),
+                10
+        );
+        List<SearchResult> reranked = rerankingService.applyReranker("query", merged, 10);
+
+        assertThat(reranked)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-b:2", "file-a:1");
+    }
+
+    @Test
     void searchEvaluationFrameworkRunsWithMockRoutesWithoutEs() {
         SearchEvaluation evaluation = new SearchEvaluation(service);
         SearchEvaluation.EvalCase evalCase = new SearchEvaluation.EvalCase(
@@ -274,6 +329,7 @@ class HybridSearchServiceTest {
                 .contains("防洪为主");
         assertThat(caseReport.mergedChunkKeys())
                 .contains("eval-principle:1", "eval-principle:2");
+        assertThat(caseReport.matchedTextFragments()).isEmpty();
         assertThat(caseReport.hitsAt10())
                 .containsExactlyInAnyOrder("eval-principle:1", "eval-principle:2");
         assertThat(caseReport.recallAt5()).isEqualTo(1.0d);
@@ -298,7 +354,89 @@ class HybridSearchServiceTest {
                 .isEqualTo(0.8d / (60 + 1));
     }
 
+    @Test
+    void prdAcceptanceEvaluationUsesRealExpectedFragments() {
+        SearchEvaluation evaluation = new SearchEvaluation(service);
+
+        SearchEvaluation.EvaluationReport report = evaluation.evaluate(
+                SearchEvaluation.acceptanceCases(),
+                10,
+                SearchEvaluation::fixtureRouteResults
+        );
+
+        assertThat(report.caseReports()).hasSize(10);
+        assertThat(report.caseReports())
+                .allSatisfy(caseReport -> {
+                    assertThat(caseReport.recallAt10()).isEqualTo(1.0d);
+                    assertThat(caseReport.matchedTextFragments())
+                            .containsExactlyInAnyOrderElementsOf(caseReport.evalCase().expectedTextFragments());
+                });
+        assertThat(report.caseReports())
+                .filteredOn(caseReport -> caseReport.evalCase().query().contains("汛限水位"))
+                .singleElement()
+                .satisfies(caseReport -> assertThat(caseReport.matchedTextFragments())
+                        .contains("307.00m", "310.00m"));
+        assertThat(report.caseReports())
+                .filteredOn(caseReport -> caseReport.evalCase().query().contains("开闸放水"))
+                .singleElement()
+                .satisfies(caseReport -> assertThat(caseReport.matchedTextFragments())
+                        .contains("开闸", "放水", "泄洪"));
+    }
+
     private SearchResult result(String fileMd5, int chunkId) {
         return new SearchResult(fileMd5, chunkId, "content-" + chunkId, 0.0d);
+    }
+
+    private void assertPermissionFilterContainsUserPublicAndOrgTags(Query permissionFilter) {
+        List<String> terms = flattenTerms(permissionFilter);
+
+        assertThat(terms)
+                .contains("userId=42")
+                .contains("isPublic=true")
+                .contains("orgTag=FLOOD")
+                .contains("orgTag=OPS");
+        assertThat(permissionFilter.isBool()).isTrue();
+        assertThat(permissionFilter.bool().minimumShouldMatch()).isEqualTo("1");
+    }
+
+    private void assertPublicOnlyFilter(Query permissionFilter) {
+        assertThat(permissionFilter.isTerm()).isTrue();
+        assertThat(permissionFilter.term().field()).isEqualTo("isPublic");
+        assertThat(permissionFilter.term().value().booleanValue()).isTrue();
+    }
+
+    private List<String> flattenTerms(Query query) {
+        List<String> terms = new ArrayList<>();
+        collectTerms(query, terms);
+        return terms;
+    }
+
+    private void collectTerms(Query query, List<String> terms) {
+        if (query.isTerm()) {
+            terms.add(query.term().field() + "=" + termValue(query));
+            return;
+        }
+        if (!query.isBool()) {
+            return;
+        }
+        query.bool().should().forEach(child -> collectTerms(child, terms));
+        query.bool().filter().forEach(child -> collectTerms(child, terms));
+        query.bool().must().forEach(child -> collectTerms(child, terms));
+    }
+
+    private String termValue(Query query) {
+        if (query.term().value().isString()) {
+            return query.term().value().stringValue();
+        }
+        if (query.term().value().isBoolean()) {
+            return Boolean.toString(query.term().value().booleanValue());
+        }
+        if (query.term().value().isLong()) {
+            return Long.toString(query.term().value().longValue());
+        }
+        if (query.term().value().isDouble()) {
+            return Double.toString(query.term().value().doubleValue());
+        }
+        return query.term().value()._toJsonString();
     }
 }

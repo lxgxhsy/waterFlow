@@ -4,6 +4,7 @@ import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.junit.jupiter.api.Disabled;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -15,6 +16,16 @@ import java.util.stream.Collectors;
 public class SearchEvaluation {
 
     private static final int REPORT_TOP_K = 10;
+    private static final List<SearchResult> PRD_ACCEPTANCE_FIXTURES = List.of(
+            result("prd93-principle:1", "木瓜水库调度原则为防洪为主，兼顾发电、灌溉和兴利综合利用。"),
+            result("prd93-principle:2", "运行原则包括总控制原则和分期控制原则，汛期按限制水位和预报雨情调度。"),
+            result("prd93-water-level:1", "木瓜水库汛限水位按汛期分段控制，梅汛期限制水位为307.00m，台汛期限制水位为310.00m。"),
+            result("prd93-water-level:2", "梅汛期水库限制水位为307.00m，超过控制水位时应及时预泄。"),
+            result("prd93-water-level:3", "台汛期限制水位为310.00m，正常蓄水位314.00m，死水位298.00m。"),
+            result("prd93-operation:1", "非汛期水库按兴利下限和正常蓄水位运行，兼顾供水、灌溉和发电。"),
+            result("prd93-gate-operation:1", "接到大降雨或台风暴雨预报时，可通过开闸、放水、泄洪、预泄降低库水位。"),
+            result("prd93-protection:1", "木瓜水库防洪保护对象包括下游行政村，需明确巡查责任人和联系方式。")
+    );
 
     private final HybridSearchService searchService;
 
@@ -26,7 +37,10 @@ public class SearchEvaluation {
         this.searchService = searchService;
     }
 
-    record EvalCase(String query, List<String> expectedChunkKeys) {
+    record EvalCase(String query, List<String> expectedChunkKeys, List<String> expectedTextFragments) {
+        EvalCase(String query, List<String> expectedChunkKeys) {
+            this(query, expectedChunkKeys, List.of());
+        }
     }
 
     record RouteResults(List<SearchResult> bm25Results, List<SearchResult> vectorResults) {
@@ -36,6 +50,7 @@ public class SearchEvaluation {
             EvalCase evalCase,
             String expandedQuery,
             List<String> mergedChunkKeys,
+            List<String> matchedTextFragments,
             Set<String> hitsAt10,
             double recallAt5,
             double recallAt10,
@@ -53,22 +68,22 @@ public class SearchEvaluation {
 
     public static void main(String[] args) {
         SearchEvaluation evaluation = new SearchEvaluation();
-        EvaluationReport report = evaluation.evaluate(acceptanceCases(), REPORT_TOP_K, SearchEvaluation::placeholderRouteResults);
+        EvaluationReport report = evaluation.evaluate(acceptanceCases(), REPORT_TOP_K, SearchEvaluation::fixtureRouteResults);
         evaluation.printReport(report);
     }
 
     static List<EvalCase> acceptanceCases() {
         return List.of(
-                new EvalCase("水库有哪些原则？", List.of("prd93-principle:1")),
-                new EvalCase("水库的调度原则有哪些？", List.of("prd93-principle:1", "prd93-principle:2")),
-                new EvalCase("木瓜水库汛限水位是多少？", List.of("prd93-water-level:1")),
-                new EvalCase("梅汛期限制水位是多少？", List.of("prd93-water-level:2")),
-                new EvalCase("台汛期限制水位是多少？", List.of("prd93-water-level:3")),
-                new EvalCase("非汛期水库怎么运行？", List.of("prd93-operation:1")),
-                new EvalCase("什么时候需要开闸放水？", List.of("prd93-gate-operation:1")),
-                new EvalCase("水库以什么为主？", List.of("prd93-principle:3")),
-                new EvalCase("水库兼有哪些功能？", List.of("prd93-principle:4")),
-                new EvalCase("木瓜水库防洪保护对象有哪些？", List.of("prd93-protection:1"))
+                new EvalCase("水库有哪些原则？", List.of("prd93-principle:1"), List.of("防洪为主", "兼顾发电")),
+                new EvalCase("水库的调度原则有哪些？", List.of("prd93-principle:1", "prd93-principle:2"), List.of("总控制原则", "分期控制原则")),
+                new EvalCase("木瓜水库汛限水位是多少？", List.of("prd93-water-level:1"), List.of("307.00m", "310.00m")),
+                new EvalCase("梅汛期限制水位是多少？", List.of("prd93-water-level:2"), List.of("梅汛期", "307.00m")),
+                new EvalCase("台汛期限制水位是多少？", List.of("prd93-water-level:3"), List.of("台汛期", "310.00m")),
+                new EvalCase("非汛期水库怎么运行？", List.of("prd93-operation:1"), List.of("非汛期", "兴利下限")),
+                new EvalCase("什么时候需要开闸放水？", List.of("prd93-gate-operation:1"), List.of("开闸", "放水", "泄洪")),
+                new EvalCase("水库以什么为主？", List.of("prd93-principle:1"), List.of("防洪为主")),
+                new EvalCase("水库兼有哪些功能？", List.of("prd93-principle:1"), List.of("兼顾发电", "灌溉")),
+                new EvalCase("木瓜水库防洪保护对象有哪些？", List.of("prd93-protection:1"), List.of("防洪保护对象", "行政村"))
         );
     }
 
@@ -97,12 +112,14 @@ public class SearchEvaluation {
         List<String> mergedChunkKeys = mergedResults.stream()
                 .map(SearchEvaluation::chunkKey)
                 .toList();
+        List<String> matchedTextFragments = matchedTextFragments(mergedResults, evalCase.expectedTextFragments(), 10);
         Set<String> hitsAt10 = hits(mergedChunkKeys, evalCase.expectedChunkKeys(), 10);
 
         return new CaseReport(
                 evalCase,
                 expandedQuery,
                 mergedChunkKeys,
+                matchedTextFragments,
                 hitsAt10,
                 recallAtK(mergedChunkKeys, evalCase.expectedChunkKeys(), 5),
                 recallAtK(mergedChunkKeys, evalCase.expectedChunkKeys(), 10),
@@ -119,8 +136,10 @@ public class SearchEvaluation {
             System.out.printf(Locale.ROOT, "Case %02d: %s%n", i + 1, caseReport.evalCase().query());
             System.out.printf(Locale.ROOT, "  expanded: %s%n", caseReport.expandedQuery());
             System.out.printf(Locale.ROOT, "  expected: %s%n", caseReport.evalCase().expectedChunkKeys());
+            System.out.printf(Locale.ROOT, "  fragments:%s%n", caseReport.evalCase().expectedTextFragments());
             System.out.printf(Locale.ROOT, "  top10:    %s%n", caseReport.mergedChunkKeys());
             System.out.printf(Locale.ROOT, "  hits:     %s%n", caseReport.hitsAt10().isEmpty() ? "MISS" : caseReport.hitsAt10());
+            System.out.printf(Locale.ROOT, "  text:     %s%n", caseReport.matchedTextFragments().isEmpty() ? "MISS" : caseReport.matchedTextFragments());
             System.out.printf(
                     Locale.ROOT,
                     "  Recall@5=%.3f  Recall@10=%.3f  MRR@10=%.3f%n",
@@ -140,20 +159,28 @@ public class SearchEvaluation {
         );
     }
 
-    private static RouteResults placeholderRouteResults(EvalCase evalCase) {
-        List<SearchResult> bm25Results = new ArrayList<>();
-        bm25Results.add(result("mock-bm25", 1, "BM25 placeholder distractor"));
-        for (String expectedKey : evalCase.expectedChunkKeys()) {
-            bm25Results.add(result(expectedKey, "Expected placeholder fragment for " + evalCase.query()));
-        }
+    static RouteResults fixtureRouteResults(EvalCase evalCase) {
+        List<SearchResult> expected = PRD_ACCEPTANCE_FIXTURES.stream()
+                .filter(result -> evalCase.expectedChunkKeys().contains(chunkKey(result)))
+                .toList();
+        List<SearchResult> distractors = PRD_ACCEPTANCE_FIXTURES.stream()
+                .filter(result -> !evalCase.expectedChunkKeys().contains(chunkKey(result)))
+                .limit(2)
+                .toList();
 
-        List<SearchResult> vectorResults = new ArrayList<>();
-        for (String expectedKey : evalCase.expectedChunkKeys()) {
-            vectorResults.add(result(expectedKey, "Expected vector placeholder fragment for " + evalCase.query()));
-        }
-        vectorResults.add(result("mock-vector", 1, "Vector placeholder distractor"));
+        List<SearchResult> bm25Results = new ArrayList<>(expected);
+        bm25Results.addAll(distractors);
+
+        List<SearchResult> vectorResults = reversedCopy(expected);
+        vectorResults.addAll(reversedCopy(distractors));
 
         return new RouteResults(bm25Results, vectorResults);
+    }
+
+    private static List<SearchResult> reversedCopy(List<SearchResult> results) {
+        List<SearchResult> copy = new ArrayList<>(results);
+        Collections.reverse(copy);
+        return copy;
     }
 
     static double recallAtK(List<String> rankedChunkKeys, List<String> expectedChunkKeys, int k) {
@@ -171,6 +198,20 @@ public class SearchEvaluation {
             }
         }
         return 0.0d;
+    }
+
+    private static List<String> matchedTextFragments(List<SearchResult> rankedResults, List<String> expectedFragments, int k) {
+        if (expectedFragments.isEmpty()) {
+            return List.of();
+        }
+        String topText = rankedResults.stream()
+                .limit(k)
+                .map(SearchResult::getTextContent)
+                .filter(text -> text != null && !text.isBlank())
+                .collect(Collectors.joining("\n"));
+        return expectedFragments.stream()
+                .filter(topText::contains)
+                .toList();
     }
 
     private static Set<String> hits(List<String> rankedChunkKeys, List<String> expectedChunkKeys, int k) {

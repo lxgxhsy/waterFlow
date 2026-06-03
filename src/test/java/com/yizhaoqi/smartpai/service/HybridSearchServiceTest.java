@@ -243,6 +243,48 @@ class HybridSearchServiceTest {
     }
 
     @Test
+    void searchEvaluationFrameworkRunsWithMockRoutesWithoutEs() {
+        SearchEvaluation evaluation = new SearchEvaluation(service);
+        SearchEvaluation.EvalCase evalCase = new SearchEvaluation.EvalCase(
+                "水库的调度原则有哪些？",
+                List.of("eval-principle:1", "eval-principle:2")
+        );
+
+        SearchEvaluation.EvaluationReport report = evaluation.evaluate(
+                List.of(evalCase),
+                10,
+                ignored -> new SearchEvaluation.RouteResults(
+                        List.of(
+                                result("eval-principle", 1),
+                                result("distractor-bm25", 10)
+                        ),
+                        List.of(
+                                result("distractor-vector", 20),
+                                result("eval-principle", 2)
+                        )
+                )
+        );
+
+        assertThat(report.caseReports()).hasSize(1);
+        SearchEvaluation.CaseReport caseReport = report.caseReports().get(0);
+
+        assertThat(caseReport.expandedQuery())
+                .contains("水库的调度原则有哪些？")
+                .contains("调度原则")
+                .contains("防洪为主");
+        assertThat(caseReport.mergedChunkKeys())
+                .contains("eval-principle:1", "eval-principle:2");
+        assertThat(caseReport.hitsAt10())
+                .containsExactlyInAnyOrder("eval-principle:1", "eval-principle:2");
+        assertThat(caseReport.recallAt5()).isEqualTo(1.0d);
+        assertThat(caseReport.recallAt10()).isEqualTo(1.0d);
+        assertThat(caseReport.mrrAt10()).isGreaterThan(0.0d);
+        assertThat(report.averageRecallAt5()).isEqualTo(1.0d);
+        assertThat(report.averageRecallAt10()).isEqualTo(1.0d);
+        assertThat(report.averageMrrAt10()).isEqualTo(caseReport.mrrAt10());
+    }
+
+    @Test
     void rrfRankStartsAtOne() {
         List<SearchResult> merged = service.mergeByRrf(
                 List.of(result("file-a", 1)),

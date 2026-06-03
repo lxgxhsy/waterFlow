@@ -1,11 +1,11 @@
-STATUS: APPROVED
-ROUND: 10
+STATUS: CHANGES_REQUESTED
+ROUND: 11
 REVIEWED_SHA: 8b8a5f34506abc84a4eadfd6a79c5d97a301e6e8
 
 ## 本轮任务
-- [x] 实现 PRD Phase 4 上下文增强：命中子 chunk 后，已补充父 chunk 或相邻 chunk 作为回答上下文，避免只返回孤立片段导致答案不完整。
-- [x] 保持检索排序边界：相邻/父 chunk 只用于上下文组装和溯源增强，不污染 RRF/reranker 候选排序分数，也不会把无权限 chunk 拼入上下文。
-- [x] 增强来源元数据：搜索结果和上下文组装结果已带文件名、chunkId，并为章节标题、页码、条款编号、父 chunk 建立字段和 ES 映射，便于回答引用更准确。
-- [x] 增加配置开关和窗口大小：默认开启安全小窗口（前后各 1 个 chunk），支持关闭上下文扩展以排查召回噪声和性能问题。
-- [x] 补充测试：已覆盖命中 chunk 后补相邻/父 chunk、权限过滤不被绕过、上下文扩展不改变原 topK 排序和分数、配置关闭时行为与当前一致。
-- [x] 验证命令已通过：`mvn test -Dtest=HybridSearchServiceTest`。
+- [ ] 补强 PRD Phase 2/验收评测：评测集需覆盖原则类、水位类、操作类、位置类、概况类、时间/汛期类，并标注期望命中文档、chunkId/关键片段、章节或条款线索。
+- [ ] 完善离线指标输出：在现有 Recall@5、Recall@10、MRR@10 基础上补齐 nDCG@10、命中文档率、命中正确章节率，并确保每个 case 可输出命中明细，便于定位失败样本。
+- [ ] 增加优化前后/配置对比能力：至少能对比 BM25-only、RRF、RRF+reranker（如开启）、上下文扩展开关等关键配置的指标结果，避免只能看单次当前实现分数。
+- [ ] 增加性能评测或基准入口：统计检索耗时（平均值、P95 或可复现的近似指标），覆盖默认 topK=10、不启用 reranker、启用 reranker/上下文扩展等场景，支撑 PRD 的 P95 验收目标。
+- [ ] 保持评测可离线运行：默认测试不依赖真实 Elasticsearch、外部 embedding/reranker/LLM 服务；如提供真实服务评测入口，必须与单元测试隔离并有明确开关。
+- [ ] 补充测试和验证命令：至少通过 `mvn test -Dtest=HybridSearchServiceTest`；如新增独立评测类/基准类，则补跑对应测试类并在 review.md 里记录命令。

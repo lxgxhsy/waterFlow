@@ -2,6 +2,7 @@ package com.yizhaoqi.smartpai.service;
 
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import co.elastic.clients.elasticsearch.core.SearchRequest;
+import com.yizhaoqi.smartpai.config.AiProperties;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import org.junit.jupiter.api.Test;
 
@@ -9,6 +10,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
@@ -279,6 +282,7 @@ class HybridSearchServiceTest {
     @Test
     void rerankerExtensionPointCanReorderMergedCandidates() {
         HybridSearchService rerankingService = new HybridSearchService();
+        rerankingService.setAiProperties(rerankerProperties(true, 50));
         rerankingService.setSearchReranker((query, candidates, topK) -> {
             List<SearchResult> reversed = new ArrayList<>(candidates);
             Collections.reverse(reversed);
@@ -295,6 +299,164 @@ class HybridSearchServiceTest {
         assertThat(reranked)
                 .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
                 .containsExactly("file-b:2", "file-a:1");
+    }
+
+    @Test
+    void rerankerDisabledByDefaultDoesNotCallConfiguredReranker() {
+        HybridSearchService defaultService = new HybridSearchService();
+        defaultService.setSearchReranker((query, candidates, topK) -> {
+            throw new AssertionError("reranker should not be called when disabled");
+        });
+        List<SearchResult> merged = defaultService.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2)),
+                List.of(),
+                10
+        );
+
+        List<SearchResult> results = defaultService.applyReranker("query", merged, 1);
+
+        assertThat(results)
+                .singleElement()
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .isEqualTo("file-a:1");
+    }
+
+    @Test
+    void enabledRerankerReceivesDefaultTop50CandidatesAndSearchTruncatesFinalTopK() {
+        InMemoryLargeRecallHybridSearchService searchService = new InMemoryLargeRecallHybridSearchService(60);
+        searchService.setAiProperties(rerankerProperties(true, 50));
+        AtomicInteger receivedCandidates = new AtomicInteger();
+        AtomicInteger receivedTopK = new AtomicInteger();
+        searchService.setSearchReranker((query, candidates, topK) -> {
+            receivedCandidates.set(candidates.size());
+            receivedTopK.set(topK);
+            List<SearchResult> reversed = new ArrayList<>(candidates);
+            Collections.reverse(reversed);
+            return reversed;
+        });
+
+        List<SearchResult> results = searchService.search("query", 5);
+
+        assertThat(receivedCandidates).hasValue(50);
+        assertThat(receivedTopK).hasValue(5);
+        assertThat(results).hasSize(5);
+        assertThat(results)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-49:49", "file-48:48", "file-47:47", "file-46:46", "file-45:45");
+    }
+
+    @Test
+    void enabledRerankerUsesConfiguredCandidateLimit() {
+        InMemoryLargeRecallHybridSearchService searchService = new InMemoryLargeRecallHybridSearchService(60);
+        searchService.setAiProperties(rerankerProperties(true, 12));
+        AtomicInteger receivedCandidates = new AtomicInteger();
+        searchService.setSearchReranker((query, candidates, topK) -> {
+            receivedCandidates.set(candidates.size());
+            return candidates;
+        });
+
+        List<SearchResult> results = searchService.search("query", 5);
+
+        assertThat(receivedCandidates).hasValue(12);
+        assertThat(results).hasSize(5);
+    }
+
+    @Test
+    void rerankerScoreIsReturnedWhenRerankerSucceeds() {
+        HybridSearchService rerankingService = new HybridSearchService();
+        rerankingService.setAiProperties(rerankerProperties(true, 50));
+        rerankingService.setSearchReranker((query, candidates, topK) -> List.of(
+                new SearchResult(
+                        candidates.get(1).getFileMd5(),
+                        candidates.get(1).getChunkId(),
+                        candidates.get(1).getTextContent(),
+                        9.75d
+                ),
+                new SearchResult(
+                        candidates.get(0).getFileMd5(),
+                        candidates.get(0).getChunkId(),
+                        candidates.get(0).getTextContent(),
+                        8.25d
+                )
+        ));
+        List<SearchResult> merged = rerankingService.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2)),
+                List.of(),
+                10
+        );
+
+        List<SearchResult> results = rerankingService.applyReranker("query", merged, 2);
+
+        assertThat(results)
+                .extracting(result -> result.getFileMd5() + ":" + result.getChunkId())
+                .containsExactly("file-b:2", "file-a:1");
+        assertThat(results)
+                .extracting(SearchResult::getScore)
+                .containsExactly(9.75d, 8.25d);
+    }
+
+    @Test
+    void rerankerFailureFallsBackToRrfScoresAndOrdering() {
+        HybridSearchService rerankingService = new HybridSearchService();
+        rerankingService.setAiProperties(rerankerProperties(true, 50));
+        rerankingService.setSearchReranker((query, candidates, topK) -> {
+            throw new RuntimeException("reranker unavailable");
+        });
+        List<SearchResult> merged = rerankingService.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2)),
+                List.of(),
+                10
+        );
+
+        List<SearchResult> results = rerankingService.applyReranker("query", merged, 1);
+
+        assertThat(results)
+                .singleElement()
+                .satisfies(result -> {
+                    assertThat(result.getFileMd5()).isEqualTo("file-a");
+                    assertThat(result.getScore()).isEqualTo(0.8d / (60 + 1));
+                });
+    }
+
+    @Test
+    void nullRerankerResultFallsBackToRrfScoresAndOrdering() {
+        HybridSearchService rerankingService = new HybridSearchService();
+        rerankingService.setAiProperties(rerankerProperties(true, 50));
+        rerankingService.setSearchReranker((query, candidates, topK) -> null);
+        List<SearchResult> merged = rerankingService.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2)),
+                List.of(),
+                10
+        );
+
+        List<SearchResult> results = rerankingService.applyReranker("query", merged, 1);
+
+        assertThat(results)
+                .singleElement()
+                .satisfies(result -> {
+                    assertThat(result.getFileMd5()).isEqualTo("file-a");
+                    assertThat(result.getScore()).isEqualTo(0.8d / (60 + 1));
+                });
+    }
+
+    @Test
+    void enabledRerankerWithoutImplementationFallsBackToRrfScoresAndOrdering() {
+        HybridSearchService rerankingService = new HybridSearchService();
+        rerankingService.setAiProperties(rerankerProperties(true, 50));
+        List<SearchResult> merged = rerankingService.mergeByRrf(
+                List.of(result("file-a", 1), result("file-b", 2)),
+                List.of(),
+                10
+        );
+
+        List<SearchResult> results = rerankingService.applyReranker("query", merged, 1);
+
+        assertThat(results)
+                .singleElement()
+                .satisfies(result -> {
+                    assertThat(result.getFileMd5()).isEqualTo("file-a");
+                    assertThat(result.getScore()).isEqualTo(0.8d / (60 + 1));
+                });
     }
 
     @Test
@@ -390,6 +552,13 @@ class HybridSearchServiceTest {
 
     private SearchResult result(String fileMd5, int chunkId) {
         return new SearchResult(fileMd5, chunkId, "content-" + chunkId, 0.0d);
+    }
+
+    private static AiProperties rerankerProperties(boolean enabled, int candidateLimit) {
+        AiProperties properties = new AiProperties();
+        properties.getReranker().setEnabled(enabled);
+        properties.getReranker().setCandidateLimit(candidateLimit);
+        return properties;
     }
 
     private static SearchResult result(String fileMd5, int chunkId, String textContent) {
@@ -503,6 +672,50 @@ class HybridSearchServiceTest {
         }
 
         private record ScoredResult(SearchResult result, int score) {
+        }
+    }
+
+    private static class InMemoryLargeRecallHybridSearchService extends HybridSearchService {
+
+        private final List<SearchResult> corpus;
+        private final AtomicReference<String> embeddedQuery = new AtomicReference<>();
+
+        private InMemoryLargeRecallHybridSearchService(int corpusSize) {
+            List<SearchResult> results = new ArrayList<>();
+            for (int i = 0; i < corpusSize; i++) {
+                results.add(result("file-" + i, i, "content-" + i));
+            }
+            this.corpus = results;
+        }
+
+        @Override
+        protected List<Float> embedToVectorList(String text) {
+            embeddedQuery.set(text);
+            return List.of(1.0f, 0.0f, 0.0f);
+        }
+
+        @Override
+        protected List<SearchResult> searchBm25WithPermission(String recallQuery,
+                                                              String userDbId,
+                                                              List<String> userEffectiveTags,
+                                                              int recallK) {
+            return corpus.stream()
+                    .limit(recallK)
+                    .toList();
+        }
+
+        @Override
+        protected List<SearchResult> searchVectorWithPermission(List<Float> queryVector,
+                                                                String userDbId,
+                                                                List<String> userEffectiveTags,
+                                                                int recallK) {
+            assertThat(embeddedQuery.get()).isEqualTo("query");
+            return List.of();
+        }
+
+        @Override
+        protected void attachFileNames(List<SearchResult> results) {
+            // In-memory test data has no file metadata.
         }
     }
 

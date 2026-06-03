@@ -14,6 +14,7 @@ public class AiProperties {
 
     private Prompt prompt = new Prompt();
     private Generation generation = new Generation();
+    private Reranker reranker = new Reranker();
 
     @Data
     public static class Prompt {
@@ -35,5 +36,13 @@ public class AiProperties {
         private Integer maxTokens = 2000;
         /** nucleus top-p */
         private Double topP = 0.9;
+    }
+
+    @Data
+    public static class Reranker {
+        /** 是否启用 reranker 精排；默认关闭，避免依赖外部精排服务 */
+        private Boolean enabled = false;
+        /** RRF 后送入 reranker 的候选窗口大小 */
+        private Integer candidateLimit = 50;
     }
 } 

@@ -6,6 +6,7 @@ import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import com.yizhaoqi.smartpai.client.EmbeddingClient;
+import com.yizhaoqi.smartpai.config.AiProperties;
 import com.yizhaoqi.smartpai.entity.EsDocument;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import com.yizhaoqi.smartpai.model.User;
@@ -42,6 +43,7 @@ public class HybridSearchService {
     private static final int BM25_RECALL_MULTIPLIER = 20;
     private static final int VECTOR_RECALL_MULTIPLIER = 30;
     private static final int VECTOR_NUM_CANDIDATE_MULTIPLIER = 50;
+    private static final int DEFAULT_RERANKER_CANDIDATE_LIMIT = 50;
     private static final int RRF_RANK_CONSTANT = 60;
     private static final double RRF_BM25_WEIGHT = 0.8d;
     private static final double RRF_VECTOR_WEIGHT = 1.0d;
@@ -64,12 +66,19 @@ public class HybridSearchService {
     @Autowired
     private FileUploadRepository fileUploadRepository;
 
-    private SearchReranker searchReranker = SearchReranker.identity();
+    @Autowired
+    private AiProperties aiProperties = new AiProperties();
+
+    private SearchReranker searchReranker;
 
     @Autowired(required = false)
     void setSearchReranker(SearchReranker searchReranker) {
-        if (searchReranker != null) {
-            this.searchReranker = searchReranker;
+        this.searchReranker = searchReranker;
+    }
+
+    void setAiProperties(AiProperties aiProperties) {
+        if (aiProperties != null) {
+            this.aiProperties = aiProperties;
         }
     }
 
@@ -116,7 +125,8 @@ public class HybridSearchService {
             List<SearchResult> vectorResults = vectorFuture.join();
             logger.debug("双路并行召回完成，BM25 候选数量: {}, 向量候选数量: {}", bm25Results.size(), vectorResults.size());
 
-            List<SearchResult> results = applyReranker(query, mergeByRrf(bm25Results, vectorResults, resultK), resultK);
+            List<SearchResult> rrfCandidates = mergeByRrf(bm25Results, vectorResults, rerankerCandidateLimit(resultK));
+            List<SearchResult> results = applyReranker(query, rrfCandidates, resultK);
             logger.debug("返回搜索结果数量: {}", results.size());
             attachFileNames(results);
             return results;
@@ -185,7 +195,8 @@ public class HybridSearchService {
             List<SearchResult> vectorResults = vectorFuture.join();
             logger.debug("双路并行召回完成，BM25 候选数量: {}, 向量候选数量: {}", bm25Results.size(), vectorResults.size());
 
-            List<SearchResult> results = applyReranker(query, mergeByRrf(bm25Results, vectorResults, resultK), resultK);
+            List<SearchResult> rrfCandidates = mergeByRrf(bm25Results, vectorResults, rerankerCandidateLimit(resultK));
+            List<SearchResult> results = applyReranker(query, rrfCandidates, resultK);
             attachFileNames(results);
             return results;
         } catch (Exception e) {
@@ -320,11 +331,27 @@ public class HybridSearchService {
     }
 
     List<SearchResult> applyReranker(String query, List<SearchResult> mergedResults, int topK) {
-        List<SearchResult> reranked = searchReranker.rerank(query, mergedResults, normalizeTopK(topK));
-        if (reranked == null) {
-            return mergedResults;
+        int resultK = normalizeTopK(topK);
+        List<SearchResult> rrfResults = limitResults(safeResults(mergedResults), resultK);
+        if (!rerankerEnabled()) {
+            return rrfResults;
         }
-        return limitResults(reranked, topK);
+        if (searchReranker == null) {
+            logger.warn("reranker 已启用但未配置实现，回退到 RRF 排序");
+            return rrfResults;
+        }
+
+        try {
+            List<SearchResult> reranked = searchReranker.rerank(query, safeResults(mergedResults), resultK);
+            if (reranked == null) {
+                logger.warn("reranker 返回 null，回退到 RRF 排序");
+                return rrfResults;
+            }
+            return limitResults(reranked, resultK);
+        } catch (Exception e) {
+            logger.warn("reranker 调用失败，回退到 RRF 排序", e);
+            return rrfResults;
+        }
     }
 
     @FunctionalInterface
@@ -420,8 +447,25 @@ public class HybridSearchService {
                 .toList();
     }
 
+    private List<SearchResult> safeResults(List<SearchResult> results) {
+        if (results == null) {
+            return Collections.emptyList();
+        }
+        return results;
+    }
+
     private int normalizeTopK(int topK) {
         return Math.max(1, topK);
+    }
+
+    private boolean rerankerEnabled() {
+        return Boolean.TRUE.equals(aiProperties.getReranker().getEnabled());
+    }
+
+    private int rerankerCandidateLimit(int topK) {
+        Integer configuredLimit = aiProperties.getReranker().getCandidateLimit();
+        int candidateLimit = configuredLimit == null ? DEFAULT_RERANKER_CANDIDATE_LIMIT : configuredLimit;
+        return Math.max(normalizeTopK(topK), candidateLimit);
     }
 
     private int bm25RecallK(int topK) {

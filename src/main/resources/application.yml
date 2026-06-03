@@ -114,6 +114,9 @@ embedding:
 ai:
   knowledge-graph:
     enabled: false
+  reranker:
+    enabled: false
+    candidate-limit: 50
   prompt:
     rules: |
         你是派聪明知识助手，须遵守：

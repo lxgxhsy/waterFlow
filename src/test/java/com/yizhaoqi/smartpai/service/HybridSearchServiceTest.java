@@ -494,12 +494,19 @@ class HybridSearchServiceTest {
         assertThat(caseReport.matchedTextFragments()).isEmpty();
         assertThat(caseReport.hitsAt10())
                 .containsExactlyInAnyOrder("eval-principle:1", "eval-principle:2");
+        assertThat(caseReport.hitDetails())
+                .extracting(SearchEvaluation.HitDetail::chunkKey)
+                .contains("eval-principle:1", "eval-principle:2");
+        assertThat(caseReport.documentHit()).isTrue();
         assertThat(caseReport.recallAt5()).isEqualTo(1.0d);
         assertThat(caseReport.recallAt10()).isEqualTo(1.0d);
         assertThat(caseReport.mrrAt10()).isGreaterThan(0.0d);
+        assertThat(caseReport.ndcgAt10()).isGreaterThan(0.0d);
         assertThat(report.averageRecallAt5()).isEqualTo(1.0d);
         assertThat(report.averageRecallAt10()).isEqualTo(1.0d);
         assertThat(report.averageMrrAt10()).isEqualTo(caseReport.mrrAt10());
+        assertThat(report.averageNdcgAt10()).isEqualTo(caseReport.ndcgAt10());
+        assertThat(report.documentHitRate()).isEqualTo(1.0d);
     }
 
     @Test
@@ -526,13 +533,23 @@ class HybridSearchServiceTest {
                 10
         );
 
-        assertThat(report.caseReports()).hasSize(10);
+        assertThat(report.caseReports()).hasSize(12);
+        assertThat(report.caseReports())
+                .extracting(caseReport -> caseReport.evalCase().category())
+                .contains("原则类", "水位类", "操作类", "位置类", "概况类", "时间/汛期类");
         assertThat(report.caseReports())
                 .allSatisfy(caseReport -> {
                     assertThat(caseReport.recallAt10()).isEqualTo(1.0d);
+                    assertThat(caseReport.documentHit()).isTrue();
+                    assertThat(caseReport.sectionHit()).isTrue();
+                    assertThat(caseReport.ndcgAt10()).isGreaterThan(0.0d);
+                    assertThat(caseReport.hitDetails()).isNotEmpty();
                     assertThat(caseReport.matchedTextFragments())
                             .containsExactlyInAnyOrderElementsOf(caseReport.evalCase().expectedTextFragments());
                 });
+        assertThat(report.averageNdcgAt10()).isGreaterThan(0.0d);
+        assertThat(report.documentHitRate()).isEqualTo(1.0d);
+        assertThat(report.sectionHitRate()).isEqualTo(1.0d);
         assertThat(report.caseReports())
                 .filteredOn(caseReport -> caseReport.evalCase().query().contains("汛限水位"))
                 .singleElement()
@@ -544,10 +561,77 @@ class HybridSearchServiceTest {
                 .satisfies(caseReport -> assertThat(caseReport.matchedTextFragments())
                         .contains("开闸", "放水", "泄洪"));
         assertThat(recallService.bm25RecallQueries())
-                .hasSize(10)
+                .hasSize(12)
                 .anySatisfy(query -> assertThat(query).contains("307.00m", "310.00m"))
                 .anySatisfy(query -> assertThat(query).contains("开闸", "放水", "泄洪"));
-        assertThat(recallService.vectorRecallCount()).isEqualTo(10);
+        assertThat(recallService.vectorRecallCount()).isEqualTo(12);
+    }
+
+    @Test
+    void searchEvaluationComparesOfflineVariants() {
+        SearchEvaluation evaluation = new SearchEvaluation(service);
+        List<SearchEvaluation.EvalCase> cases = List.of(new SearchEvaluation.EvalCase(
+                "水位类",
+                "木瓜水库汛限水位是多少？",
+                "prd93-water-level",
+                List.of("prd93-water-level:1"),
+                List.of("307.00m"),
+                List.of("汛限水位")
+        ));
+        SearchResult expected = result("prd93-water-level", 1, "汛限水位为307.00m");
+        expected.setSectionTitle("汛限水位");
+        SearchResult distractor = result("distractor", 1, "其他内容");
+
+        SearchEvaluation.ComparisonReport comparison = evaluation.compareVariants(
+                cases,
+                List.of(
+                        new SearchEvaluation.EvaluationVariant("BM25-only", ignored -> List.of(distractor)),
+                        new SearchEvaluation.EvaluationVariant("RRF", ignored -> List.of(expected, distractor)),
+                        new SearchEvaluation.EvaluationVariant("RRF+reranker", ignored -> List.of(expected)),
+                        new SearchEvaluation.EvaluationVariant("RRF+context-expansion-off", ignored -> List.of(expected))
+                )
+        );
+
+        assertThat(comparison.variantReports())
+                .extracting(SearchEvaluation.VariantReport::name)
+                .containsExactly("BM25-only", "RRF", "RRF+reranker", "RRF+context-expansion-off");
+        assertThat(comparison.variantReports().get(0).report().averageRecallAt10()).isZero();
+        assertThat(comparison.variantReports().get(1).report().averageRecallAt10()).isEqualTo(1.0d);
+        assertThat(comparison.variantReports().get(1).report().documentHitRate()).isEqualTo(1.0d);
+        assertThat(comparison.variantReports().get(1).report().sectionHitRate()).isEqualTo(1.0d);
+    }
+
+    @Test
+    void searchEvaluationBenchmarkRunsOfflineAndReportsLatency() {
+        SearchEvaluation evaluation = new SearchEvaluation(service);
+        List<SearchEvaluation.EvalCase> cases = List.of(new SearchEvaluation.EvalCase(
+                "操作类",
+                "什么时候需要开闸放水？",
+                "prd93-gate-operation",
+                List.of("prd93-gate-operation:1"),
+                List.of("开闸"),
+                List.of("闸门操作")
+        ));
+        SearchResult expected = result("prd93-gate-operation", 1, "闸门操作包括开闸放水");
+        expected.setSectionTitle("闸门操作");
+
+        SearchEvaluation.BenchmarkReport benchmark = evaluation.benchmark(
+                cases,
+                1,
+                List.of(
+                        new SearchEvaluation.BenchmarkScenario("topK=10 no-reranker", ignored -> List.of(expected), 2),
+                        new SearchEvaluation.BenchmarkScenario("topK=10 reranker", ignored -> List.of(expected), 2),
+                        new SearchEvaluation.BenchmarkScenario("topK=10 context-expansion", ignored -> List.of(expected), 2)
+                )
+        );
+
+        assertThat(benchmark.results()).hasSize(3);
+        assertThat(benchmark.results())
+                .allSatisfy(result -> {
+                    assertThat(result.iterations()).isEqualTo(2);
+                    assertThat(result.averageMillis()).isGreaterThanOrEqualTo(0.0d);
+                    assertThat(result.p95Millis()).isGreaterThanOrEqualTo(0.0d);
+                });
     }
 
     @Test
@@ -658,6 +742,13 @@ class HybridSearchServiceTest {
         return new SearchResult(fileMd5, chunkId, textContent, 0.0d, null, null, true);
     }
 
+    private static SearchResult resultWithSection(String fileMd5, int chunkId, String textContent, String sectionTitle) {
+        SearchResult result = result(fileMd5, chunkId, textContent);
+        result.setSectionTitle(sectionTitle);
+        result.setClauseNumber(sectionTitle);
+        return result;
+    }
+
     private static SearchResult richResult(String fileMd5,
                                            int chunkId,
                                            String textContent,
@@ -676,14 +767,17 @@ class HybridSearchServiceTest {
     private static class InMemoryRecallHybridSearchService extends HybridSearchService {
 
         private final List<SearchResult> corpus = List.of(
-                result("prd93-principle", 1, "木瓜水库调度原则为防洪为主，兼顾发电、灌溉和兴利综合利用。"),
-                result("prd93-principle", 2, "运行原则包括总控制原则和分期控制原则，汛期按限制水位和预报雨情调度。"),
-                result("prd93-water-level", 1, "木瓜水库汛限水位按汛期分段控制，梅汛期限制水位为307.00m，台汛期限制水位为310.00m。"),
-                result("prd93-water-level", 2, "梅汛期水库限制水位为307.00m，超过控制水位时应及时预泄。"),
-                result("prd93-water-level", 3, "台汛期限制水位为310.00m，正常蓄水位314.00m，死水位298.00m。"),
-                result("prd93-operation", 1, "非汛期水库按兴利下限和正常蓄水位运行，兼顾供水、灌溉和发电。"),
-                result("prd93-gate-operation", 1, "接到大降雨或台风暴雨预报时，可通过开闸、放水、泄洪、预泄降低库水位。"),
-                result("prd93-protection", 1, "木瓜水库防洪保护对象包括下游行政村，需明确巡查责任人和联系方式。"),
+                resultWithSection("prd93-principle", 1, "木瓜水库调度原则为防洪为主，兼顾发电、灌溉和兴利综合利用。", "调度原则"),
+                resultWithSection("prd93-principle", 2, "运行原则包括总控制原则和分期控制原则，汛期按限制水位和预报雨情调度。", "总控制原则 分期控制原则"),
+                resultWithSection("prd93-water-level", 1, "木瓜水库汛限水位按汛期分段控制，梅汛期限制水位为307.00m，台汛期限制水位为310.00m。", "汛限水位"),
+                resultWithSection("prd93-water-level", 2, "梅汛期水库限制水位为307.00m，超过控制水位时应及时预泄。", "梅汛期"),
+                resultWithSection("prd93-water-level", 3, "台汛期限制水位为310.00m，正常蓄水位314.00m，死水位298.00m。", "台汛期"),
+                resultWithSection("prd93-operation", 1, "非汛期水库按兴利下限和正常蓄水位运行，兼顾供水、灌溉和发电。", "非汛期运行"),
+                resultWithSection("prd93-gate-operation", 1, "接到大降雨或台风暴雨预报时，可通过开闸、放水、泄洪、预泄降低库水位。", "闸门操作"),
+                resultWithSection("prd93-location", 1, "工程位置：木瓜水库位于淳安县中洲镇，坝址地处支流上游。", "工程位置"),
+                resultWithSection("prd93-overview", 1, "工程概况：木瓜水库为小型水库，控制运行计划用于指导年度调度。", "工程概况"),
+                resultWithSection("prd93-flood-season", 1, "汛期分为梅汛期和台汛期，分别执行不同限制水位。", "汛期"),
+                resultWithSection("prd93-protection", 1, "木瓜水库防洪保护对象包括下游行政村，需明确巡查责任人和联系方式。", "防洪保护对象"),
                 result("distractor-geology", 1, "坝址地质条件、岩性和渗流监测记录用于工程安全复核。"),
                 result("distractor-weather", 1, "气象站记录包括风速、湿度和逐小时降雨量观测数据。"),
                 result("distractor-power", 1, "电站机组检修计划按年度维护窗口编制。"),
@@ -749,14 +843,23 @@ class HybridSearchServiceTest {
             if (query.contains("原则")) {
                 return byChunkKeys("prd93-principle:1", "prd93-principle:2", "prd93-water-level:1");
             }
-            if (query.contains("汛限水位") || query.contains("限制水位") || query.contains("梅汛期") || query.contains("台汛期")) {
-                return byChunkKeys("prd93-water-level:1", "prd93-water-level:2", "prd93-water-level:3");
-            }
             if (query.contains("非汛期")) {
                 return byChunkKeys("prd93-operation:1", "prd93-water-level:3", "prd93-principle:1");
             }
             if (query.contains("开闸") || query.contains("放水")) {
                 return byChunkKeys("prd93-gate-operation:1", "prd93-water-level:2", "prd93-water-level:1");
+            }
+            if (query.contains("位置") || query.contains("位于") || query.contains("坝址")) {
+                return byChunkKeys("prd93-location:1", "distractor-geology:1", "prd93-overview:1");
+            }
+            if (query.contains("概况") || query.contains("介绍") || query.contains("基本情况")) {
+                return byChunkKeys("prd93-overview:1", "prd93-location:1", "prd93-protection:1");
+            }
+            if (query.contains("汛期分") || query.contains("阶段")) {
+                return byChunkKeys("prd93-flood-season:1", "prd93-water-level:1", "prd93-principle:2");
+            }
+            if (query.contains("汛限水位") || query.contains("限制水位") || query.contains("梅汛期") || query.contains("台汛期")) {
+                return byChunkKeys("prd93-water-level:1", "prd93-water-level:2", "prd93-water-level:3");
             }
             if (query.contains("为主") || query.contains("功能")) {
                 return byChunkKeys("prd93-principle:1", "prd93-operation:1", "prd93-principle:2");

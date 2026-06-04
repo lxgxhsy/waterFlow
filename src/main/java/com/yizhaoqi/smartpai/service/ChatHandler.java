@@ -326,17 +326,62 @@ public class ChatHandler {
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < searchResults.size(); i++) {
             SearchResult result = searchResults.get(i);
-            String snippet = cleanSnippet(result.getTextContent());
+            String snippet = cleanSnippet(buildContextSnippet(result));
             if (snippet == null || snippet.isBlank()) {
                 continue;
             }
             if (snippet.length() > MAX_SNIPPET_LEN) {
                 snippet = snippet.substring(0, MAX_SNIPPET_LEN) + "…";
             }
-            String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
-            context.append(String.format("来源#%d: %s%n摘录: %s%n%n", i + 1, fileLabel, snippet));
+            context.append(String.format("来源#%d: %s%n摘录: %s%n%n", i + 1, sourceLabel(result), snippet));
         }
         return context.toString();
+    }
+
+    private String buildContextSnippet(SearchResult result) {
+        if (result.getContextChunks() == null || result.getContextChunks().isEmpty()) {
+            return result.getTextContent();
+        }
+
+        StringBuilder snippet = new StringBuilder();
+        for (SearchResult.ContextChunk contextChunk : result.getContextChunks()) {
+            String text = cleanSnippet(contextChunk.getTextContent());
+            if (text.isBlank()) {
+                continue;
+            }
+            snippet.append("[")
+                    .append(contextChunk.getRelation() == null ? "context" : contextChunk.getRelation())
+                    .append(" chunkId=")
+                    .append(contextChunk.getChunkId() == null ? "unknown" : contextChunk.getChunkId());
+            if (contextChunk.getSectionTitle() != null && !contextChunk.getSectionTitle().isBlank()) {
+                snippet.append(", section=").append(contextChunk.getSectionTitle());
+            }
+            if (contextChunk.getPageNumber() != null) {
+                snippet.append(", page=").append(contextChunk.getPageNumber());
+            }
+            if (contextChunk.getClauseNumber() != null && !contextChunk.getClauseNumber().isBlank()) {
+                snippet.append(", clause=").append(contextChunk.getClauseNumber());
+            }
+            snippet.append("] ").append(text).append("\n");
+        }
+        return snippet.toString();
+    }
+
+    private String sourceLabel(SearchResult result) {
+        String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
+        StringBuilder label = new StringBuilder(fileLabel)
+                .append(" chunkId=")
+                .append(result.getChunkId() == null ? "unknown" : result.getChunkId());
+        if (result.getSectionTitle() != null && !result.getSectionTitle().isBlank()) {
+            label.append(" section=").append(result.getSectionTitle());
+        }
+        if (result.getPageNumber() != null) {
+            label.append(" page=").append(result.getPageNumber());
+        }
+        if (result.getClauseNumber() != null && !result.getClauseNumber().isBlank()) {
+            label.append(" clause=").append(result.getClauseNumber());
+        }
+        return label.toString();
     }
 
     private String buildRagOnlyContext(List<SearchResult> searchResults) {

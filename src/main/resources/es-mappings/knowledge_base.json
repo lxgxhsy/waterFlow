@@ -29,6 +29,18 @@
       },
       "isPublic": {
         "type": "boolean"
+      },
+      "sectionTitle": {
+        "type": "keyword"
+      },
+      "pageNumber": {
+        "type": "integer"
+      },
+      "clauseNumber": {
+        "type": "keyword"
+      },
+      "parentChunkId": {
+        "type": "integer"
       }
     }
   }

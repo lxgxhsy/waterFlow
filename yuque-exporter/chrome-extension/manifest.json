@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "语雀纯净提取器",
+  "version": "2.0.0",
+  "permissions": ["activeTab", "scripting", "tabs", "storage"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.yuque.com/*"],
+      "js": ["unlock.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://*.yuque.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

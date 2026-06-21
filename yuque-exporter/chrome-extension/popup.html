@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 320px; padding: 16px; font-family: "Segoe UI", Tahoma, sans-serif; background: #f9f9f9; }
+    .header { font-size: 16px; font-weight: bold; margin-bottom: 12px; color: #00b96b; border-bottom: 2px solid #00b96b; padding-bottom: 6px; }
+    .btn {
+      width: 100%; padding: 10px; color: white; border: none;
+      border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: filter 0.2s;
+      margin-bottom: 8px;
+    }
+    .btn:hover { filter: brightness(0.9); }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-primary { background: #00b96b; }
+    .btn-batch  { background: #1677ff; }
+    #status { margin-top: 8px; font-size: 12px; color: #555; text-align: center; line-height: 1.6; }
+    #progress { display: none; margin-top: 8px; }
+    progress { width: 100%; height: 6px; border-radius: 3px; }
+    .tip { font-size: 11px; color: #999; margin-top: 4px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="header">语雀增强提取器 v2</div>
+  <button class="btn btn-primary" id="extractBtn">提取当前页 → 复制</button>
+  <button class="btn btn-batch"  id="batchBtn">批量导出全库 → 下载 ZIP</button>
+  <div id="progress">
+    <progress id="progressBar" value="0" max="100"></progress>
+    <div id="progressText" style="font-size:11px;text-align:center;color:#555;"></div>
+  </div>
+  <div id="status">准备就绪</div>
+  <div class="tip">批量导出：先打开任意一个知识库页面，再点击按钮</div>
+  <script src="popup.js"></script>
+</body>
+</html>

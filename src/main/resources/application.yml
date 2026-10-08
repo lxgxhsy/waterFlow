@@ -114,6 +114,13 @@ embedding:
 ai:
   knowledge-graph:
     enabled: false
+  reranker:
+    enabled: false
+    candidate-limit: 50
+  context-expansion:
+    enabled: true
+    before-window: 1
+    after-window: 1
   prompt:
     rules: |
         你是派聪明知识助手，须遵守：

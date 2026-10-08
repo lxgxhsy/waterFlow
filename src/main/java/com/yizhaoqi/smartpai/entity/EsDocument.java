@@ -20,6 +20,10 @@ public class EsDocument {
     private String userId;         // 上传用户ID
     private String orgTag;         // 组织标签
     private boolean isPublic;      // 是否公开
+    private String sectionTitle;   // 章节标题，供引用溯源使用
+    private Integer pageNumber;    // 页码，供引用溯源使用
+    private String clauseNumber;   // 条款编号，供引用溯源使用
+    private Integer parentChunkId; // 父 chunk，供层级上下文扩展使用
 
     /**
      * 默认构造函数，用于Jackson反序列化
@@ -33,6 +37,15 @@ public class EsDocument {
     public EsDocument(String id, String fileMd5, int chunkId, String content,
                      String metaSummary, float[] vector, String modelVersion,
                      String userId, String orgTag, boolean isPublic) {
+        this(id, fileMd5, chunkId, content, metaSummary, vector, modelVersion,
+                userId, orgTag, isPublic, null, null, null, null);
+    }
+
+    public EsDocument(String id, String fileMd5, int chunkId, String content,
+                     String metaSummary, float[] vector, String modelVersion,
+                     String userId, String orgTag, boolean isPublic,
+                     String sectionTitle, Integer pageNumber, String clauseNumber,
+                     Integer parentChunkId) {
         this.id = id;
         this.fileMd5 = fileMd5;
         this.chunkId = chunkId;
@@ -43,6 +56,10 @@ public class EsDocument {
         this.userId = userId;
         this.orgTag = orgTag;
         this.isPublic = isPublic;
+        this.sectionTitle = sectionTitle;
+        this.pageNumber = pageNumber;
+        this.clauseNumber = clauseNumber;
+        this.parentChunkId = parentChunkId;
     }
     
 
